@@ -1,0 +1,19 @@
+{
+  "name": "zipscribe",
+  "version": "1.0.0",
+  "description": "A fast, **on-device** macOS menu-bar dictation app. Hold a Push-to-Talk hotkey, speak, release — and within a couple of seconds the cleansed prose is typed into whatever window you focused, with no audio ever leaving your machine.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.3"
+  }
+}

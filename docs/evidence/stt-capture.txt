@@ -1,0 +1,16 @@
+## stt-capture evidence
+Fri Oct 16 17:21:04 CDT 2026
+
+=== capture unit tests ===
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+=== live 3s mic capture ===
+
+[record] 48051 samples @ 16000 Hz -> 3.00s (rms -0.3 dB)
+wrote /var/folders/0g/0p5qyz750p31vnq1kw13p1hm0000gq/T/whisperflow-rs-record-94881/clip.wav and /var/folders/0g/0p5qyz750p31vnq1kw13p1hm0000gq/T/whisperflow-rs-record-94881/clip.pcm
+
+=== WAV header (RIFF/WAVE, 16k mono 16-bit) ===
+00000000: 5249 4646 54fb 0000 5741 5645 666d 7420  RIFFT...WAVEfmt 
+00000010: 1000 0000 0100 0100 803e 0000 007d 0000  .........>...}..
+00000020: 0200 0000 1000 6461 7461 28fb            ......data(.
+/var/folders/0g/0p5qyz750p31vnq1kw13p1hm0000gq/T/whisperflow-rs-record-94932/clip.wav: RIFF (little-endian) data, WAVE audio, Microsoft PCM, mono 16000 Hz

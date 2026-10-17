@@ -1,0 +1,28 @@
+### 12-verify: COMPLETE LIVE PIPELINE — TTS -> mic -> STT -> qwen2.5:7b clean -> KEYSTROKE into focused window -> read back
+
+--- [1] record 5s of mic while TTS speaks (real audio captured) ---
+[record] 80199 samples @ 16000 Hz -> 5.01s (rms -0.1 dB)
+wrote /var/folders/0g/0p5qyz750p31vnq1kw13p1hm0000gq/T/whisperflow-rs-record-17594/clip.wav and /var/folders/0g/0p5qyz750p31vnq1kw13p1hm0000gq/T/whisperflow-rs-record-17594/clip.pcm
+
+--- [2] STT: in-process whisper-medium.en transcribes the captured audio ---
+RAW transcript: We should reschedule the meeting to Friday and confirm the details with the crime.
+
+--- [3] clean via configurable local Ollama qwen2.5:7b (default) ---
+CLEAN: We should reschedule the meeting to Friday and confirm the details with everyone.
+
+--- [4] deliver via real enigo KEYSTROKE into a focused application window (Accessibility granted) ---
+[type-demo] output_mode=type — typing into the focused window: "We should reschedule the meeting to Friday and confirm the details with everyone."
+[type-demo] done
+
+--- [5] PROOF: read the focused window's document back from disk ---
+Text that our keystrokes landed in the TextEdit window:
+    [We should reschedule the meeting to Friday and confirm the details with everyone.]
+
+--- [6] filler-removal on fresh inputs (the crux), live qwen2.5:7b ---
+RAW : uh um so like i was saying i mean can you um send the the report by tomorrow
+CLEAN: Can you send the report by tomorrow?
+RAW : okay so um you know let me i mean lets just go with option two and confirm it by the end of the day
+CLEAN: Let's go with option two and confirm it by the end of the day.
+
+--- tests + build ---
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

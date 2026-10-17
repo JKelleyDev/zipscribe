@@ -1,0 +1,15 @@
+## stt-whisper evidence
+Fri Oct 16 18:04:09 CDT 2026
+
+=== whisper-medium.en (type 4) loaded in-process, two transcriptions from ONE resident model ===
+[transcribe] loading model (resident): models/ggml-medium.en.bin
+whisper_model_load:          CPU total size =  1533.14 MB
+[transcribe] model resident in 0.32s
+RAW: WhisperFlow is a local dictation app.
+[transcribe] inference took 1.31s
+RAW: quick brown fox jumps over the lazy dog.
+[transcribe] inference took 1.30s
+[transcribe] transcribed 2 files from one resident model
+
+ground truth: 'Whisperflow is a local dictation app' + 'The quick brown fox jumps over the lazy dog'
+(model path: models/ggml-medium.en.bin, 1533 MB fp16, whisper.cpp BLAS backend, M5 Pro 18-core)

@@ -1,0 +1,6 @@
+[toolchain]
+# Pin to the stable Apple Silicon aarch64 toolchain this project was built on.
+channel = "stable-aarch64-apple-darwin"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-apple-darwin"]
+profile = "minimal"

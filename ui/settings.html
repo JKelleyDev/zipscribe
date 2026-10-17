@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zipscribe Settings</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page" id="page">
+  <h1>Zipscribe</h1>
+  <p class="muted" id="state">Loading…</p>
+
+  <h2>General</h2>
+  <div class="card">
+    <div class="row"><div class="label">Dictation enabled<small>Pause to ignore the hotkey</small></div>
+      <label class="switch"><input type="checkbox" id="enabled"><span></span></label></div>
+    <div class="row"><div class="label">Push-to-talk hotkey<small>Hold to record, release to type</small></div>
+      <div class="keycap" id="hotkey" style="cursor:pointer"></div></div>
+    <div class="row"><div class="label">Start at login</div>
+      <label class="switch"><input type="checkbox" id="login"><span></span></label></div>
+  </div>
+
+  <h2>Output</h2>
+  <div class="card">
+    <div class="row"><div class="label">How text is delivered</div>
+      <select id="output_mode" class="w-sm">
+        <option value="type">Type it</option>
+        <option value="paste">Paste it (⌘V)</option>
+        <option value="clipboard">Copy to clipboard only</option>
+      </select></div>
+    <div class="row"><div class="label">Press Return after typing</div>
+      <label class="switch"><input type="checkbox" id="newline"><span></span></label></div>
+  </div>
+
+  <h2>Speech model</h2>
+  <div class="card" id="models"></div>
+  <div id="dlbox"></div>
+
+  <h2>Text clean-up (Ollama)</h2>
+  <div class="card">
+    <div class="row"><div class="label">Use AI clean-up<small id="ollama_state"></small></div>
+      <label class="switch"><input type="checkbox" id="cleanup"><span></span></label></div>
+    <div class="row"><div class="label">Model</div>
+      <select id="cmodel" class="w-sm"></select></div>
+    <div class="row"><div class="label">Ollama address</div>
+      <input type="url" id="url" class="w-sm"></div>
+    <div class="col"><div style="display:flex;justify-content:space-between;margin-bottom:6px">
+      <span>Instructions to the model</span><button class="link" id="resetprompt">Reset to default</button></div>
+      <textarea id="prompt"></textarea></div>
+  </div>
+
+  <h2>Permissions</h2>
+  <div class="card">
+    <div class="row"><div class="label">Microphone</div><span class="chip" id="p_mic"></span><button id="b_mic">Open Settings</button></div>
+    <div class="row"><div class="label">Accessibility<small>Needed to type into other apps</small></div><span class="chip" id="p_ax"></span><button id="b_ax">Open Settings</button></div>
+  </div>
+
+  <h2>Help</h2>
+  <div class="card">
+    <div class="row"><div class="label">Setup guide<small>Walk through the first-run steps again</small></div><button id="rerun">Open</button></div>
+    <div class="row"><div class="label">Log file<small id="logpath"></small></div></div>
+    <div class="row"><div class="label">Uninstall Zipscribe<small>Remove the app, login item and permissions from this Mac</small></div><button class="danger" id="uninstall">Uninstall…</button></div>
+  </div>
+
+<div class="modal" id="umodal" hidden><div class="dialog">
+  <h2 style="margin-top:0">Uninstall Zipscribe?</h2>
+  <p class="muted">This quits Zipscribe, moves the app to the Trash, removes the start-at-login item and resets its microphone and Accessibility permissions.</p>
+  <label class="opt"><input type="checkbox" id="u_model" checked><div><b>Delete the downloaded speech model</b><small>Frees up to 1.5 GB</small></div></label>
+  <label class="opt"><input type="checkbox" id="u_settings" checked><div><b>Delete my settings and log</b><small>Your hotkey and clean-up preferences</small></div></label>
+  <p class="muted" style="font-size:12px">Ollama and its models are separate and are not touched.</p>
+  <div style="display:flex;justify-content:flex-end;gap:8px"><button id="u_cancel">Cancel</button><button class="danger" id="u_go">Uninstall</button></div>
+</div></div>
+</div>
+<div class="bar-bottom"><span class="muted" id="dirty"></span><div class="grow"></div>
+  <button class="primary" id="save">Save</button></div>
+
+<script src="common.js"></script>
+<script>
+let cfg, models = [], ollamaModels = [], dl = null, dirty = false;
+
+const els = {};
+["enabled","hotkey","login","output_mode","newline","cleanup","cmodel","url","prompt","state","ollama_state"].forEach((k) => (els[k] = $("#" + k)));
+
+function markDirty() { dirty = true; $("#dirty").textContent = "Unsaved changes"; }
+
+function fill() {
+  els.enabled.checked = cfg.enabled;
+  els.output_mode.value = cfg.output_mode;
+  els.newline.checked = cfg.type_trailing_newline;
+  els.cleanup.checked = cfg.cleanup_enabled;
+  els.url.value = cfg.ollama_url;
+  els.prompt.value = cfg.cleanup_system_prompt;
+  fillModels();
+  fillCleanupModels();
+}
+
+function fillCleanupModels() {
+  const names = ollamaModels.slice();
+  if (!names.includes(cfg.cleanup_model)) names.unshift(cfg.cleanup_model);
+  els.cmodel.innerHTML = names.map((n) => `<option ${n === cfg.cleanup_model ? "selected" : ""}>${n}</option>`).join("");
+  els.ollama_state.textContent = ollamaModels.length ? "Ollama is running" : "Ollama not detected — text is only lightly tidied";
+}
+
+function fillModels() {
+  const sel = cfg.stt_model.replace(/^whisper-/, "");
+  $("#models").innerHTML = models.map((m) => `
+    <label class="opt">
+      <input type="radio" name="model" value="${m.id}" ${m.id === sel ? "checked" : ""}>
+      <div style="flex:1"><b>${m.label}</b> ${m.installed ? `<span class="chip ok">Installed</span>` : ""}<small>${fmtMB(m.size_mb)}</small></div>
+      ${m.installed ? "" : `<button data-dl="${m.id}" ${dl ? "disabled" : ""}>Download</button>`}
+    </label>`).join("");
+  $("#models").querySelectorAll("input[name=model]").forEach((r) =>
+    r.addEventListener("change", () => { cfg.stt_model = "whisper-" + r.value; markDirty(); }));
+  $("#models").querySelectorAll("[data-dl]").forEach((b) =>
+    b.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      try { await invoke("download_model", { id: b.dataset.dl }); dl = { id: b.dataset.dl, done: 0, total: 0 }; showDl(); fillModels(); }
+      catch (e) { toast(String(e)); }
+    }));
+}
+
+function showDl(err) {
+  const box = $("#dlbox");
+  if (!dl) { box.innerHTML = err ? `<p style="color:var(--bad)">${err}</p>` : ""; return; }
+  const pct = dl.total ? (100 * dl.done / dl.total).toFixed(1) : 0;
+  box.innerHTML = `<div class="bar"><div style="width:${pct}%"></div></div>
+    <div class="muted">Downloading ${dl.id}… ${fmtBytes(dl.done)} of ${fmtBytes(dl.total)} <button class="link" id="cancel">Cancel</button></div>`;
+  $("#cancel").addEventListener("click", () => invoke("cancel_download"));
+}
+
+async function refreshPerms() {
+  const p = await invoke("permissions");
+  chip($("#p_mic"), p.microphone === "authorized" ? "Allowed" : p.microphone === "not_determined" ? "Not asked" : "Blocked", p.microphone === "authorized" ? "ok" : "bad");
+  chip($("#p_ax"), p.accessibility ? "Allowed" : "Needed", p.accessibility ? "ok" : "bad");
+  const s = await invoke("service_status");
+  els.state.textContent = !s.hotkey_registered ? "⚠ The hotkey is not registered — choose a different shortcut."
+    : s.model_ready ? "Ready." : s.model_error ? "⚠ " + s.model_error : "Loading speech model…";
+}
+
+async function refreshOllama() {
+  try { ollamaModels = await invoke("ollama_models", { url: els.url.value }); } catch { ollamaModels = []; }
+  fillCleanupModels();
+}
+
+["enabled","newline","cleanup"].forEach((k) => els[k].addEventListener("change", markDirty));
+els.output_mode.addEventListener("change", markDirty);
+els.prompt.addEventListener("input", markDirty);
+els.cmodel.addEventListener("change", markDirty);
+els.url.addEventListener("input", markDirty);
+els.url.addEventListener("change", refreshOllama);
+els.login.addEventListener("change", async () => {
+  try { await invoke("set_login_item", { on: els.login.checked }); toast(els.login.checked ? "Will start at login" : "Won't start at login"); }
+  catch (e) { toast(String(e)); els.login.checked = !els.login.checked; }
+});
+$("#resetprompt").addEventListener("click", async () => { els.prompt.value = await invoke("default_prompt"); markDirty(); });
+$("#b_mic").addEventListener("click", () => invoke("open_system_settings", { pane: "microphone" }));
+$("#b_ax").addEventListener("click", async () => { if (!(await invoke("request_accessibility"))) invoke("open_system_settings", { pane: "accessibility" }); });
+$("#rerun").addEventListener("click", () => invoke("open_setup_window"));
+$("#uninstall").addEventListener("click", () => { $("#umodal").hidden = false; });
+$("#u_cancel").addEventListener("click", () => { $("#umodal").hidden = true; });
+$("#u_go").addEventListener("click", async () => {
+  try { await invoke("uninstall_app", { deleteModel: $("#u_model").checked, deleteSettings: $("#u_settings").checked }); }
+  catch (e) { toast(String(e)); }
+});
+
+$("#save").addEventListener("click", async () => {
+  const next = {
+    ...cfg,
+    enabled: els.enabled.checked,
+    output_mode: els.output_mode.value,
+    type_trailing_newline: els.newline.checked,
+    cleanup_enabled: els.cleanup.checked,
+    cleanup_mode: els.cleanup.checked ? "ollama" : "local_fallback",
+    cleanup_model: els.cmodel.value,
+    ollama_url: els.url.value.trim() || "http://localhost:11434",
+    cleanup_system_prompt: els.prompt.value,
+  };
+  try { await invoke("save_config", { cfg: next }); cfg = next; dirty = false; $("#dirty").textContent = ""; toast("Saved"); refreshPerms(); }
+  catch (e) { toast(String(e)); }
+});
+
+listen("download-progress", (e) => { dl = e.payload; showDl(); });
+listen("download-done", async (e) => {
+  dl = null;
+  models = await invoke("model_list");
+  showDl(e.payload.error && e.payload.error !== "cancelled" ? e.payload.error : null);
+  fillModels();
+});
+
+(async () => {
+  cfg = await invoke("get_config");
+  models = await invoke("model_list");
+  els.login.checked = await invoke("login_item_enabled");
+  $("#logpath").textContent = await invoke("log_path");
+  const hk = hotkeyRecorder(els.hotkey, cfg.hotkey, (v) => { cfg.hotkey = v; markDirty(); });
+  fill();
+  // The hotkey is applied on Save, so a bad combo can't strand the user.
+  refreshOllama();
+  refreshPerms();
+  setInterval(refreshPerms, 2000);
+})();
+</script>
+</body>
+</html>

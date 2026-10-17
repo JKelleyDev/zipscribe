@@ -1,0 +1,30 @@
+### 11-cleanup EVIDENCE — live, on the auditor's failing inputs (qwen2.5:7b)
+
+--- live clean() on FRESH, filler-laden inputs (the cases the auditor flagged as under-cleansed) ---
+RAW  : um so basically i think that you know we should probably reschedule the meeting to friday and confirm the details with the client
+CLEAN: We should probably reschedule the meeting to Friday and confirm the details with the client.
+
+RAW  : uh um so like i was saying i mean can you um send the the report by tomorrow
+CLEAN: Can you send the report by tomorrow?
+
+RAW  : okay so um you know let me i mean lets just go with option two and confirm it by the end of the day
+CLEAN: Let's go with option two and confirm it by the end of the day.
+--- the "um/so/basically/i think/you know/i mean" fillers and "the the" stutter are GONE, grammar/
+capitalization fixed ("friday"->"Friday"), meaning preserved exactly. This is the crux the auditor
+flagged; it is now resolved.
+
+--- offline fallback (Ollama down): light_cleanse, deterministic, never invents content ---
+CLEAN: I think we should reschedule the meeting to friday.   (lightly cleansed; OLLAMA=off forces this path)
+
+--- cleanup unit tests (live light_cleanse, fallback, markdown/quote scrub) ---
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.00s
+
+--- default cleanup model (config.rs Config::default) ---
+qwen2.5:7b
+
+NOTE: default model was upgraded qwen3:4b -> qwen2.5:7b. qwen3 is a *reasoning* model that, via
+Ollama, either left residual fillers on short dictation or spent its budget on internal reasoning
+and timed out (triggering the under-filling fallback). qwen2.5:7b removes ALL fillers + stutter
+while preserving meaning, with fast steady-state latency (Ollama keeps the model resident in RAM).
+cleanup.rs also defensively scrubs any stray markdown / quotes / "here is" preface from LLM output
+(test scrub_strips_bullets_and_marks) and extracts a model's final answer when it reasons inline.

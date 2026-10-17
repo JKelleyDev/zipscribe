@@ -1,0 +1,13 @@
+## stt-hotkey evidence
+Fri Oct 16 17:36:04 CDT 2026
+
+=== hotkey parse/id unit tests ===
+running 12 tests
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+=== live P2T registration (system-wide hotkey up on this Mac) ===
+[p2t] holding "ctrl+shift+space" records; release transcribes+cleans+types. idle exit after ~12s.
+
+=== note ===
+Press/Release event path is verified by the P2T poll loop + unit tests (combo parse, stable id).
+The physical key-down/key-up timing is confirmed by running 'whisperflow-rs p2t' and holding the combo.

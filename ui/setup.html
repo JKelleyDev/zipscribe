@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome to Zipscribe</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page" id="page"></div>
+<div class="bar-bottom">
+  <button id="back">Back</button>
+  <div class="dots" id="dots"></div>
+  <button class="primary" id="next">Continue</button>
+</div>
+<script src="common.js"></script>
+<script>
+const STEPS = ["welcome", "mic", "access", "model", "cleanup", "hotkey"];
+let step = 0;
+let cfg;
+let perms = { microphone: "not_determined", accessibility: false };
+let models = [];
+let ollama = { reachable: false, models: [] };
+let dl = null; // {id, done, total} while downloading
+let dlError = null;
+let accessSkipped = false;
+let pollTimer = null;
+
+const page = $("#page");
+$("#dots").innerHTML = STEPS.map(() => "<i></i>").join("");
+
+function canContinue() {
+  switch (STEPS[step]) {
+    case "mic": return perms.microphone === "authorized";
+    case "access": return perms.accessibility || accessSkipped;
+    case "model": return !dl && models.find((m) => m.id === selectedModel())?.installed;
+    default: return true;
+  }
+}
+const selectedModel = () => cfg.stt_model.replace(/^whisper-/, "");
+
+function render() {
+  [...$("#dots").children].forEach((d, i) => d.classList.toggle("on", i <= step));
+  $("#back").style.visibility = step === 0 ? "hidden" : "visible";
+  const last = step === STEPS.length - 1;
+  $("#next").textContent = last ? "Finish" : step === 0 ? "Get started" : "Continue";
+  $("#next").disabled = !canContinue();
+  views[STEPS[step]]();
+}
+
+const views = {
+  welcome() {
+    page.innerHTML = `
+      <div class="hero">🎙</div>
+      <h1>Welcome to Zipscribe</h1>
+      <p class="muted">Hold a key, speak, let go — your words are typed into whatever app you're using.
+      Everything runs on this Mac. Your voice never leaves it.</p>
+      <p>This quick setup will:</p>
+      <div class="card">
+        <div class="row"><div class="label">1. Allow the microphone</div></div>
+        <div class="row"><div class="label">2. Allow typing into other apps</div></div>
+        <div class="row"><div class="label">3. Download the speech model</div></div>
+        <div class="row"><div class="label">4. Set up optional text clean-up</div></div>
+        <div class="row"><div class="label">5. Pick your hotkey and try it</div></div>
+      </div>`;
+  },
+
+  mic() {
+    const m = perms.microphone;
+    const [txt, kind] = m === "authorized" ? ["Allowed", "ok"] : m === "denied" || m === "restricted" ? ["Blocked", "bad"] : ["Not yet asked", "warn"];
+    page.innerHTML = `
+      <h1>Microphone</h1>
+      <p class="muted">Zipscribe records only while you hold the hotkey. Audio is processed on this Mac and is never uploaded.</p>
+      <div class="card"><div class="row">
+        <div class="label">Microphone access<small>${m === "denied" ? "Turn Zipscribe on in System Settings → Privacy & Security → Microphone." : "macOS will ask you to confirm."}</small></div>
+        <span class="chip ${kind}">${txt}</span>
+      </div></div>
+      <p style="margin-top:14px">
+        ${m === "not_determined" ? `<button class="primary" id="ask">Allow microphone</button>` : m === "authorized" ? "" : `<button class="primary" id="open">Open System Settings</button>`}
+      </p>`;
+    $("#ask")?.addEventListener("click", () => invoke("request_microphone"));
+    $("#open")?.addEventListener("click", () => invoke("open_system_settings", { pane: "microphone" }));
+  },
+
+  access() {
+    const ok = perms.accessibility;
+    page.innerHTML = `
+      <h1>Type into other apps</h1>
+      <p class="muted">To type your words for you, macOS requires the <b>Accessibility</b> permission. Zipscribe uses it only to press keys.</p>
+      <div class="card"><div class="row">
+        <div class="label">Accessibility access<small>${ok ? "" : "Click the button, then switch Zipscribe on in the list that opens."}</small></div>
+        <span class="chip ${ok ? "ok" : "warn"}">${ok ? "Allowed" : "Needed"}</span>
+      </div></div>
+      <p style="margin-top:14px">${ok ? "" : `<button class="primary" id="ask">Grant access</button> <button class="link" id="skip">Skip — copy text to the clipboard instead</button>`}</p>`;
+    $("#ask")?.addEventListener("click", async () => { await invoke("request_accessibility"); });
+    $("#skip")?.addEventListener("click", () => {
+      accessSkipped = true;
+      cfg.output_mode = "clipboard";
+      render();
+    });
+  },
+
+  model() {
+    const sel = selectedModel();
+    const cur = models.find((m) => m.id === sel);
+    page.innerHTML = `
+      <h1>Speech model</h1>
+      <p class="muted">The model turns your voice into text, on-device. Bigger is more accurate; all are free. It's a one-time download.</p>
+      <div class="card">
+        ${models.map((m) => `
+          <label class="opt">
+            <input type="radio" name="model" value="${m.id}" ${m.id === sel ? "checked" : ""} ${dl ? "disabled" : ""}>
+            <div><b>${m.label}</b> ${m.installed ? `<span class="chip ok">Installed</span>` : ""}<small>${fmtMB(m.size_mb)}</small></div>
+          </label>`).join("")}
+      </div>
+      <div id="dlbox" style="margin-top:14px">
+        ${dl ? `<div class="bar"><div id="fill" style="width:${dl.total ? (100 * dl.done / dl.total).toFixed(1) : 0}%"></div></div>
+          <div class="muted" id="dltext">Downloading… ${fmtBytes(dl.done)} of ${fmtBytes(dl.total)}</div>
+          <p style="margin-top:8px"><button id="cancel">Cancel</button></p>`
+        : cur?.installed ? "" : `<button class="primary" id="download">Download ${cur ? fmtMB(cur.size_mb) : ""}</button>`}
+        ${dlError ? `<p style="color:var(--bad);margin-top:8px">${dlError}</p>` : ""}
+      </div>`;
+    page.querySelectorAll("input[name=model]").forEach((r) =>
+      r.addEventListener("change", () => { cfg.stt_model = "whisper-" + r.value; dlError = null; render(); }));
+    $("#download")?.addEventListener("click", async () => {
+      dlError = null;
+      try { await invoke("download_model", { id: sel }); dl = { id: sel, done: 0, total: 0 }; }
+      catch (e) { dlError = String(e); }
+      render();
+    });
+    $("#cancel")?.addEventListener("click", () => invoke("cancel_download"));
+  },
+
+  cleanup() {
+    const reach = ollama.reachable;
+    page.innerHTML = `
+      <h1>Text clean-up <span class="muted" style="font-weight:400">(optional)</span></h1>
+      <p class="muted">A small local language model can remove "um"s and fix punctuation before typing. It runs through <b>Ollama</b>, also on this Mac. Without it, Zipscribe still types a lightly tidied transcript.</p>
+      <div class="card">
+        <div class="row"><div class="label">Ollama<small>${reach ? "Running on this Mac" : "Not detected"}</small></div>
+          <span class="chip ${reach ? "ok" : "warn"}">${reach ? "Found" : "Not found"}</span></div>
+        ${reach ? `
+        <div class="row"><div class="label">Use AI clean-up</div>
+          <label class="switch"><input type="checkbox" id="cu" ${cfg.cleanup_enabled ? "checked" : ""}><span></span></label></div>
+        <div class="row ${cfg.cleanup_enabled ? "" : "hidden"}" id="cmrow"><div class="label">Model<small>Larger models clean up better but are slower</small></div>
+          <select id="cm" class="w-sm">${modelOptions()}</select></div>`
+        : `<div class="col"><p class="muted" style="margin:0">To enable it, install Ollama from <b>ollama.com</b>, then run <code>ollama pull qwen2.5:7b</code> in Terminal.</p></div>`}
+      </div>
+      <p style="margin-top:14px"><button id="recheck">Check again</button></p>`;
+    $("#cu")?.addEventListener("change", (e) => { cfg.cleanup_enabled = e.target.checked; $("#cmrow").classList.toggle("hidden", !e.target.checked); });
+    $("#cm")?.addEventListener("change", (e) => { cfg.cleanup_model = e.target.value; });
+    $("#recheck").addEventListener("click", async () => { await checkOllama(); render(); });
+  },
+
+  hotkey() {
+    page.innerHTML = `
+      <h1>Your hotkey</h1>
+      <p class="muted">Hold this shortcut while you talk, release to type. Click it to change.</p>
+      <div class="card"><div class="row"><div class="label">Push-to-talk</div><div class="keycap" id="hk" style="cursor:pointer"></div></div></div>
+      <h2>Try it</h2>
+      <p class="muted" id="ready">Click in the box, then hold the hotkey and say something.</p>
+      <textarea id="try" placeholder="Your words will appear here…"></textarea>
+      <p class="muted" style="font-size:12px">Zipscribe will start automatically when you log in. You can turn that off in Settings.</p>`;
+    hotkeyRecorder($("#hk"), cfg.hotkey, async (hk) => { cfg.hotkey = hk; await persist(); });
+    const upd = async () => {
+      const s = await invoke("service_status");
+      $("#ready").textContent = s.model_ready
+        ? "Click in the box, then hold the hotkey and say something."
+        : s.model_error ? "Model problem: " + s.model_error : "Loading the speech model…";
+    };
+    upd(); page._t = setInterval(upd, 1500);
+  },
+};
+
+function modelOptions() {
+  const names = ollama.models.slice();
+  if (!names.includes(cfg.cleanup_model)) names.unshift(cfg.cleanup_model);
+  return names.map((n) => `<option ${n === cfg.cleanup_model ? "selected" : ""}>${n}</option>`).join("");
+}
+
+async function checkOllama() {
+  try { ollama = { reachable: true, models: await invoke("ollama_models", { url: cfg.ollama_url }) }; }
+  catch { ollama = { reachable: false, models: [] }; }
+  if (!ollama.reachable) cfg.cleanup_enabled = false;
+  else if (!ollama.models.length) cfg.cleanup_enabled = false;
+  else if (!ollama.models.includes(cfg.cleanup_model)) cfg.cleanup_model = ollama.models.find((n) => /qwen2\.5/.test(n)) || ollama.models[0];
+}
+
+async function persist() { await invoke("save_config", { cfg }); }
+
+async function refresh() {
+  perms = await invoke("permissions");
+  models = await invoke("model_list");
+  const s = STEPS[step];
+  if (s === "mic" || s === "access") render();
+  else if (s === "model") { if (!dl) render(); else $("#next").disabled = !canContinue(); }
+}
+
+$("#back").addEventListener("click", () => { clearInterval(page._t); step--; render(); });
+$("#next").addEventListener("click", async () => {
+  clearInterval(page._t);
+  if (STEPS[step] === "access") { await persist(); }
+  if (STEPS[step] === "model") { await persist(); }
+  if (STEPS[step] === "cleanup") { await persist(); }
+  if (step === STEPS.length - 1) {
+    cfg.setup_complete = true;
+    await persist();
+    try { await invoke("set_login_item", { on: true }); } catch (e) { /* non-fatal; Settings can enable it */ }
+    return invoke("close_window");
+  }
+  step++;
+  if (STEPS[step] === "cleanup") await checkOllama();
+  render();
+});
+
+listen("download-progress", (e) => {
+  dl = e.payload;
+  const fill = $("#fill");
+  if (fill && dl.total) {
+    fill.style.width = (100 * dl.done / dl.total).toFixed(1) + "%";
+    $("#dltext").textContent = `Downloading… ${fmtBytes(dl.done)} of ${fmtBytes(dl.total)}`;
+  }
+});
+listen("download-done", async (e) => {
+  dl = null;
+  dlError = e.payload.error && e.payload.error !== "cancelled" ? e.payload.error : null;
+  models = await invoke("model_list");
+  if (STEPS[step] === "model") render();
+});
+
+(async () => {
+  cfg = await invoke("get_config");
+  perms = await invoke("permissions");
+  models = await invoke("model_list");
+  render();
+  pollTimer = setInterval(refresh, 1000);
+})();
+</script>
+</body>
+</html>

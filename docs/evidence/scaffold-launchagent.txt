@@ -1,0 +1,13 @@
+=== scaffold-launchagent evidence (Fri Oct 16 21:42:56 UTC 2026) ===
+--- install ---
+Installed LaunchAgent /Users/jordankelley/Library/LaunchAgents/com.jordankelley.whisperflow-rs.plist for binary /Users/jordankelley/AI-Projects/whisperflow-rs/target/release/whisperflow-rs
+--- launchctl list ---
+94020	0	com.jordankelley.whisperflow-rs
+--- plist ---
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+--- uninstall ---
+Uninstalled LaunchAgent (/Users/jordankelley/Library/LaunchAgents/com.jordankelley.whisperflow-rs.plist)
+--- launchctl after (should be clean) ---
+(clean)

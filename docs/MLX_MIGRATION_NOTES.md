@@ -10,7 +10,7 @@ On this Apple-Silicon Mac, a native Rust MLX binding loads an MLX-format LLM
 external daemon/helper process. This gate unblocked the migration.
 
 - Binding: `mlxrs` v0.2.0 + `mlxrs-sys` v0.2.0 (crates.io; `mlxrs-sys` compiles Apple's
-  MLX-C C++ sources via CMake), vendored into `src-tauri/mlx-vendor/` with a `cargo patch`.
+  MLX-C C++ sources via CMake), originally vendored with a `cargo patch` (since removed; see below).
 - Model proven: `mlx-community/Qwen3-0.6B-4bit` (335 MB, safetensors + tokenizer, MLX format).
   Downloaded into /tmp/mlxmodel for the proof.
 - Proof binary: /tmp/mlxproof (cargo project). Generation output (non-empty, coherent):
@@ -31,17 +31,14 @@ external daemon/helper process. This gate unblocked the migration.
   `tokenizer.encode(&[Prompt{role,content}], false)`.
 - CPU vs Metal: `mlxrs::Device::cpu().set_default()` + `mlxrs::stream::set_default_stream()`.
 
-## DECISION — RESOLVED: HYBRID Metal/CPU, shipped in-tree
-This machine has only the Xcode Command Line Tools, not full Xcode.app. MLX's Metal/GPU kernel
-compiler (`xcrun -sdk macosx metal`) ships only with Xcode. So the project adopts a hybrid:
-preference for Metal/GPU, auto-fall-back to CPU when Metal is absent, with a CPU-stream fallback
-patched into `mlx-vendor/mlxrs/src/stream.rs`, gated by `MLX_BUILD_METAL` in
-`mlx-vendor/mlxrs-sys/build.rs` (default ON when Metal is present, OFF otherwise). The CPU path
-keeps `cargo build`/`cargo test` green on Metal-less machines and activates the GPU on capable ones.
-On any MLX failure the cleaner falls back to the deterministic `light_cleanse`, so dictation never
-blocks. (The proof patches are now vendored in-tree via `cargo patch`, not a one-off registry edit.)
-The CPU generation of a 0.6B model is ~150s/48 tokens — slow only because this proof box has no Metal;
-on a Metal build the same code path is fast.
+## DECISION — RESOLVED: Metal only (revised 2026-10-28)
+The first cut was a hybrid Metal/CPU build so the project compiled with only the Xcode Command
+Line Tools, using patched copies of `mlxrs`/`mlxrs-sys` vendored under `src-tauri/mlx-vendor/`.
+CPU-only clean-up proved far too slow to be usable, so the app is now Metal-only: it uses the
+stock crates.io `mlxrs` (Metal on by default), requires full Xcode with the Metal toolchain to
+build, and bundles `mlx.metallib` into the app. The vendored copies are gone; macOS 14 is pinned
+via `src-tauri/.cargo/config.toml`. On any MLX failure the cleaner still falls back to the
+deterministic `light_cleanse`, so dictation never blocks.
 
 ## Migration plan — COMPLETED (ordered tasks in the goal)
 1. DONE — in-process MLX generation core (`src/mlx.rs`).

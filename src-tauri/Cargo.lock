@@ -2718,6 +2718,8 @@ dependencies = [
 [[package]]
 name = "mlxrs"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd72771402de14a1134490089ddeb6b744920291d07e7c238e1eaaee2db2400f"
 dependencies = [
  "ctor",
  "derive_more",
@@ -2743,6 +2745,8 @@ dependencies = [
 [[package]]
 name = "mlxrs-sys"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ace6d5383b15cade95fbf8b7a10dfa5c4a84b3dcfa57abe012a5020208570f25"
 dependencies = [
  "cc",
  "cmake",

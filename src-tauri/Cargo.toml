@@ -25,13 +25,7 @@ block2 = "0.6"
 objc2 = "0.6"
 
 # In-process, on-device LLM clean-up via Apple MLX, through the native Rust `mlx-rs` binding
-# (no Ollama, no external daemon). We patch mlxrs + mlxrs-sys to the vendored, source-controlled
-# copies under `mlx-vendor/` which default to a CPU build (`MLX_BUILD_METAL=OFF`) so the project
-# compiles on a machine with only the Xcode Command Line Tools; Metal activates on a full-Xcode
-# host via `ZIPSCRIBE_MLX_METAL=ON`, which release builds require (CPU-only is far too slow).
-# `mlxrs` itself is unchanged upstream; only its `mlxrs-sys` build defaults to CPU here.
+# (no Ollama, no external daemon). MLX builds with its Metal (GPU) backend, which needs full Xcode
+# with the Metal toolchain; there is no CPU build.
 mlxrs = { version = "0.2", features = ["lm", "qwen3", "tokenizer-chat"] }
 
-[patch.crates-io]
-mlxrs = { path = "mlx-vendor/mlxrs" }
-mlxrs-sys = { path = "mlx-vendor/mlxrs-sys" }

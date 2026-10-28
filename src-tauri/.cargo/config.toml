@@ -1,0 +1,4 @@
+[env]
+# MLX's Metal backend requires macOS 14. `tauri build` sets this from `minimumSystemVersion`;
+# this covers plain `cargo build` / `cargo test`.
+MACOSX_DEPLOYMENT_TARGET = "14.0"

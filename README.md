@@ -122,12 +122,11 @@ You need Apple Silicon, **full Xcode** (from the App Store) with its Metal toolc
 ```sh
 git clone https://github.com/JKelleyDev/zipscribe.git && cd zipscribe
 npm install
-ZIPSCRIBE_MLX_METAL=ON ./scripts/make-dmg.sh   # builds the app, then -> src-tauri/target/release/bundle/Zipscribe.dmg
+./scripts/make-dmg.sh   # builds the app, then -> src-tauri/target/release/bundle/Zipscribe.dmg
 ```
 
-`ZIPSCRIBE_MLX_METAL=ON` builds the clean-up model's MLX backend for the GPU. Without it (or
-without full Xcode) MLX is CPU-only, which is far too slow for clean-up: every dictation then waits
-the full `cleanup_timeout_secs` and types the simple fallback clean-up instead.
+The clean-up model runs on the GPU through MLX's Metal backend, which is why full Xcode is required;
+there is no CPU-only build.
 
 The first build compiles whisper.cpp and takes several minutes; later builds are quick. Then open
 the DMG and follow **Install** above.

@@ -250,7 +250,9 @@ fn run_clean(
     // Resolve the model dir: explicit arg path, else config resolution.
     let dir: Option<std::path::PathBuf> = match model_arg.filter(|d| !d.trim().is_empty()) {
         Some(FORCE_FALLBACK) => None,
-        Some(d) => Some(std::path::PathBuf::from(d)),
+        Some(d) if std::path::Path::new(d).is_dir() => Some(std::path::PathBuf::from(d)),
+        // A preset id or HF repo/link, resolved like the config's `cleanup_model`.
+        Some(d) => crate::cleanup_models::resolve_model_dir(d, ""),
         None => crate::cleanup_models::resolve_model_dir(
             &cfg.cleanup_model,
             &cfg.cleanup_model_path,

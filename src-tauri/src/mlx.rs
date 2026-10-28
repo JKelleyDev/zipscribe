@@ -10,11 +10,8 @@
 //! back to the deterministic `crate::cleanup::light_cleanse`. Dictation must never hang
 //! because the model is missing, broken, or out of memory.
 //!
-//! Device: MLX prefers the GPU (Metal). When the Metal backend is not built (this machine
-//! ships only the Xcode Command Line Tools, so we compile MLX CPU-only — see the
-//! `mlx-vendor/mlxrs-sys/build.rs` `MLX_BUILD_METAL=OFF` define) we force the default
-//! device + stream to CPU so the same in-process path still runs. On a machine built with
-//! Metal, `Device::gpu()` / the default (already-GPU) stream take over automatically.
+//! Device: MLX is built with its Metal backend, so everything runs on the GPU (MLX's default
+//! device). The compiled kernels (`mlx.metallib`) ship next to the app binary.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -33,25 +30,9 @@ pub struct MlxModel {
 
 /// Load an MLX model directory (safetensors + tokenizer + config.json).
 ///
-/// Forces the default device to GPU when available, else CPU, so the same in-process
-/// path runs on both. The patched MLP op layer's CPU-stream fallback covers the
-/// fully-CPU build. Returns `Err` (→ caller falls back to `light_cleanse`) on any
-/// missing file, wrong format, or backend failure.
+/// Returns `Err` (→ caller falls back to `light_cleanse`) on any missing file, wrong format,
+/// or backend failure.
 pub fn load_model(model_dir: &Path) -> Result<MlxModel, String> {
-    // Prefer the GPU device (Metal) when present; otherwise force CPU so the in-process
-    // forward pass + sampling run without a GPU. The op layer's CPU-stream fallback keeps
-    // this working on machines without full Xcode (where MLX is built CPU-only).
-    match mlxrs::Device::gpu() {
-        Ok(gpu) => {
-            let _ = gpu.set_default();
-        }
-        Err(_) => {
-            if let Ok(cpu) = mlxrs::Device::cpu() {
-                let _ = cpu.set_default();
-            }
-        }
-    }
-
     // Single in-process load: typed config + owned weights + tokenizer.
     let (config, weights, tokenizer) =
         load::load(model_dir).map_err(|e| format!("mlx load failed: {e}"))?;

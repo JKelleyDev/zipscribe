@@ -27,8 +27,9 @@ your Mac.
 1. Download `Zipscribe.dmg` from the [Releases](https://github.com/JKelleyDev/zipscribe/releases) page and open it.
 2. Drag **Zipscribe** onto **Applications**.
 3. **First launch only:** the app isn't notarized by Apple, so macOS will refuse a normal
-   double-click. In Applications, **right-click Zipscribe → Open → Open**. (Or run
-   `xattr -cr /Applications/Zipscribe.app` once, then open it normally.)
+   double-click and say it "could not verify Zipscribe is free of malware". Click **Done**, then
+   open **System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to the
+   Zipscribe message. (Or run `xattr -cr /Applications/Zipscribe.app` once, then open it normally.)
 4. A 🎙 appears in the menu bar and the setup guide opens.
 
 ### Setup guide
@@ -73,7 +74,7 @@ the clean-up model, edit the clean-up instructions, and turn on **Start at login
 
 | Problem | Fix |
 |---|---|
-| "Zipscribe can't be opened" / "damaged" on first launch | Right-click the app → **Open** → **Open**, or run `xattr -cr /Applications/Zipscribe.app`. |
+| "Could not verify Zipscribe is free of malware" / "damaged" on first launch | **System Settings → Privacy & Security → Open Anyway**, or run `xattr -cr /Applications/Zipscribe.app`. |
 | Nothing is typed, but no error | Accessibility isn't granted. System Settings → Privacy & Security → Accessibility → turn Zipscribe on. |
 | Permissions look granted but don't work after updating | The app is ad-hoc signed, so macOS ties permissions to the exact build. In Privacy & Security, **remove** the old Zipscribe entry (the `−` button) from Accessibility and Microphone, then re-add or re-grant it. |
 | Microphone step won't turn green | Quit and reopen Zipscribe. If it's still stuck, check System Settings → Privacy & Security → Microphone. |

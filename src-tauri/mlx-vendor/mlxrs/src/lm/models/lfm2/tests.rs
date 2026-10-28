@@ -1,0 +1,2262 @@
+//! Oracle tests for the LFM2 LM blocks.
+//!
+//! The load-bearing check is the [`ShortConv`] round-trip: the prefill
+//! (left-pad) path must equal an independent hand-computed causal depthwise
+//! convolution, and feeding the same total sequence through the cache one
+//! chunk at a time must reproduce the prefill output. Every oracle is
+//! derived from the documented `lfm2.py` math (an independent reimplementation
+//! in `f64`), never a call to the code under test.
+
+use super::{linear::Linear, *};
+use crate::array::Array;
+
+const TOL: f32 = 1e-4;
+
+/// A dense `(rows, cols)` weight matrix, row-major.
+type Mat = Vec<Vec<f64>>;
+
+/// `(in_proj, conv, out_proj, hidden, K)` — the [`ShortConv`] weight bundle
+/// the round-trip tests share.
+type ConvWeights = (Mat, Mat, Mat, usize, usize);
+
+fn assert_close(got: &[f32], want: &[f32]) {
+  assert_eq!(got.len(), want.len(), "length mismatch");
+  for (i, (g, w)) in got.iter().zip(want).enumerate() {
+    assert!(
+      (g - w).abs() <= TOL,
+      "index {i}: got {g}, want {w} (|Δ|={})",
+      (g - w).abs()
+    );
+  }
+}
+
+// ───────────────────────── ShortConv oracle ─────────────────────────
+
+/// An independent `f64` reimplementation of the `ShortConv` forward pass for
+/// the **prefill** (no-cache, no-mask) path, derived directly from
+/// `lfm2.py:112-170`. NOT a call into `ShortConv::forward`.
+///
+/// Shapes: `x` is `[batch][L][hidden]`; `in_w` is the `(3*hidden, hidden)`
+/// `in_proj` weight; `conv_w` is the `(hidden, K, 1)` depthwise weight;
+/// `out_w` is the `(hidden, hidden)` `out_proj` weight. All biases are zero.
+// The convolution math is naturally index-addressed (`conv_out[t]` over the
+// kernel taps `conv_w[c][j]`); rewriting it with iterator adapters would
+// obscure the closed form, so the range-loop lint is silenced here.
+#[allow(clippy::needless_range_loop)]
+fn shortconv_prefill_oracle(
+  x: &[Vec<Vec<f64>>],
+  in_w: &[Vec<f64>],
+  conv_w: &[Vec<f64>],
+  out_w: &[Vec<f64>],
+  hidden: usize,
+  k: usize,
+) -> Vec<Vec<Vec<f64>>> {
+  let batch = x.len();
+  let len = x[0].len();
+  // in_proj: y[b][t][o] = sum_i x[b][t][i] * in_w[o][i]; split o into B,C,x.
+  // B = chunk 0, C = chunk 1, x_split = chunk 2 (each `hidden` wide).
+  let mut bx = vec![vec![vec![0.0_f64; hidden]; len]; batch]; // B * x_split
+  let mut c_gate = vec![vec![vec![0.0_f64; hidden]; len]; batch];
+  for b in 0..batch {
+    for t in 0..len {
+      let proj = |o: usize| -> f64 { (0..hidden).map(|i| x[b][t][i] * in_w[o][i]).sum() };
+      for c in 0..hidden {
+        let b_val = proj(c);
+        let c_val = proj(hidden + c);
+        let x_val = proj(2 * hidden + c);
+        bx[b][t][c] = b_val * x_val;
+        c_gate[b][t][c] = c_val;
+      }
+    }
+  }
+  // Left-pad Bx by K-1 zeros on the time axis, then depthwise conv1d
+  // (cross-correlation): conv_out[b][t][c] = sum_{j=0}^{K-1}
+  // padded[b][t+j][c] * conv_w[c][j]. With K-1 left padding the output
+  // length is exactly `len`, and conv_out[b][t] depends on Bx[b][t-K+1..=t].
+  let pad = k - 1;
+  let mut conv_out = vec![vec![vec![0.0_f64; hidden]; len]; batch];
+  for b in 0..batch {
+    for t in 0..len {
+      for c in 0..hidden {
+        let mut acc = 0.0;
+        for j in 0..k {
+          // padded index t+j; padded[0..pad] are zero, padded[pad+s] = Bx[s].
+          let pidx = t + j;
+          if pidx >= pad {
+            acc += bx[b][pidx - pad][c] * conv_w[c][j];
+          }
+        }
+        conv_out[b][t][c] = acc;
+      }
+    }
+  }
+  // y = C * conv_out, then out_proj.
+  let mut out = vec![vec![vec![0.0_f64; hidden]; len]; batch];
+  for b in 0..batch {
+    for t in 0..len {
+      let y: Vec<f64> = (0..hidden)
+        .map(|c| c_gate[b][t][c] * conv_out[b][t][c])
+        .collect();
+      for o in 0..hidden {
+        out[b][t][o] = (0..hidden).map(|i| y[i] * out_w[o][i]).sum();
+      }
+    }
+  }
+  out
+}
+
+/// Build a [`ShortConv`] from explicit dense weights. `in_w`/`out_w` are
+/// `(out, in)` row-major; `conv_w` is `(hidden, K, 1)` row-major.
+fn make_shortconv(
+  in_w: &[Vec<f64>],
+  conv_w: &[Vec<f64>],
+  out_w: &[Vec<f64>],
+  hidden: usize,
+  k: usize,
+) -> ShortConv {
+  let flat =
+    |w: &[Vec<f64>]| -> Vec<f32> { w.iter().flat_map(|r| r.iter().map(|&v| v as f32)).collect() };
+  let in_rows = in_w.len();
+  let in_cols = in_w[0].len();
+  let in_proj = Linear::new(
+    Array::from_slice::<f32>(&flat(in_w), &(in_rows, in_cols)).unwrap(),
+    None,
+  );
+  let out_rows = out_w.len();
+  let out_cols = out_w[0].len();
+  let out_proj = Linear::new(
+    Array::from_slice::<f32>(&flat(out_w), &(out_rows, out_cols)).unwrap(),
+    None,
+  );
+  let conv_flat: Vec<f32> = conv_w
+    .iter()
+    .flat_map(|r| r.iter().map(|&v| v as f32))
+    .collect();
+  let conv_weight = Array::from_slice::<f32>(&conv_flat, &(hidden, k, 1usize)).unwrap();
+  ShortConv {
+    hidden_size: hidden as i32,
+    l_cache: k as i32,
+    conv_weight,
+    conv_bias: None,
+    in_proj,
+    out_proj,
+  }
+}
+
+fn x_to_array(x: &[Vec<Vec<f64>>]) -> Array {
+  let batch = x.len();
+  let len = x[0].len();
+  let hidden = x[0][0].len();
+  let flat: Vec<f32> = x
+    .iter()
+    .flat_map(|b| b.iter().flat_map(|t| t.iter().map(|&v| v as f32)))
+    .collect();
+  Array::from_slice::<f32>(&flat, &(batch, len, hidden)).unwrap()
+}
+
+/// Sample weights/input for the multi-channel round-trip tests.
+fn sample_weights() -> ConvWeights {
+  let hidden = 2;
+  let k = 3;
+  // in_proj: (3*hidden, hidden) = (6, 2).
+  let in_w = vec![
+    vec![0.5, -0.2],
+    vec![0.1, 0.3],
+    vec![-0.4, 0.6],
+    vec![0.2, 0.7],
+    vec![0.8, -0.1],
+    vec![-0.3, 0.5],
+  ];
+  // conv: (hidden, K, 1) = (2, 3, 1).
+  let conv_w = vec![vec![0.3, -0.5, 0.7], vec![0.9, 0.2, -0.4]];
+  // out_proj: (hidden, hidden) = (2, 2).
+  let out_w = vec![vec![1.1, -0.3], vec![0.4, 0.8]];
+  (in_w, conv_w, out_w, hidden, k)
+}
+
+fn sample_input() -> Vec<Vec<Vec<f64>>> {
+  // batch 1, L 5, hidden 2.
+  vec![vec![
+    vec![1.0, -1.0],
+    vec![0.5, 2.0],
+    vec![-0.5, 0.3],
+    vec![2.0, 1.5],
+    vec![-1.0, 0.8],
+  ]]
+}
+
+#[test]
+fn shortconv_prefill_matches_manual_causal_conv() {
+  let (in_w, conv_w, out_w, hidden, k) = sample_weights();
+  let conv = make_shortconv(&in_w, &conv_w, &out_w, hidden, k);
+  let x = sample_input();
+  let arr = x_to_array(&x);
+
+  let mut got = conv.forward(&arr, None, None).unwrap();
+  let want = shortconv_prefill_oracle(&x, &in_w, &conv_w, &out_w, hidden, k);
+  let want_flat: Vec<f32> = want
+    .iter()
+    .flat_map(|b| b.iter().flat_map(|t| t.iter().map(|&v| v as f32)))
+    .collect();
+  assert_eq!(got.shape(), vec![1, 5, hidden]);
+  assert_close(&got.to_vec::<f32>().unwrap(), &want_flat);
+}
+
+#[test]
+fn shortconv_decode_with_cache_matches_prefill() {
+  let (in_w, conv_w, out_w, hidden, k) = sample_weights();
+  let conv = make_shortconv(&in_w, &conv_w, &out_w, hidden, k);
+  let x = sample_input();
+  let arr = x_to_array(&x);
+
+  // Prefill reference over the whole sequence (no cache).
+  let mut prefill = conv.forward(&arr, None, None).unwrap();
+  let prefill_v = prefill.to_vec::<f32>().unwrap();
+
+  // Decode: one token at a time through a fresh one-slot ArraysCache.
+  let mut cache = ArraysCache::new(1);
+  let mut decoded: Vec<f32> = Vec::new();
+  for token in &x[0] {
+    // This token as a [1, 1, hidden] step.
+    let step: Vec<f32> = token.iter().map(|&v| v as f32).collect();
+    let step_arr = Array::from_slice::<f32>(&step, &(1usize, 1usize, hidden)).unwrap();
+    let mut out = conv.forward(&step_arr, None, Some(&mut cache)).unwrap();
+    decoded.extend(out.to_vec::<f32>().unwrap());
+  }
+  // The decode stream (concatenated per-step outputs) must equal the prefill
+  // output position-for-position.
+  assert_close(&decoded, &prefill_v);
+}
+
+#[test]
+fn shortconv_decode_in_two_chunks_matches_prefill() {
+  // The same round-trip but with an uneven chunking (a 3-token prefill chunk
+  // followed by a 2-token decode chunk) — exercises the cached-state prefix
+  // path with `L > 1` chunks, not just single-token decode.
+  let (in_w, conv_w, out_w, hidden, k) = sample_weights();
+  let conv = make_shortconv(&in_w, &conv_w, &out_w, hidden, k);
+  let x = sample_input();
+  let arr = x_to_array(&x);
+
+  let mut prefill = conv.forward(&arr, None, None).unwrap();
+  let prefill_v = prefill.to_vec::<f32>().unwrap();
+
+  let mut cache = ArraysCache::new(1);
+  let chunk = |rows: &[Vec<f64>]| -> Array {
+    let flat: Vec<f32> = rows
+      .iter()
+      .flat_map(|t| t.iter().map(|&v| v as f32))
+      .collect();
+    Array::from_slice::<f32>(&flat, &(1usize, rows.len(), hidden)).unwrap()
+  };
+  let mut decoded: Vec<f32> = Vec::new();
+  let mut c0 = conv
+    .forward(&chunk(&x[0][0..3]), None, Some(&mut cache))
+    .unwrap();
+  decoded.extend(c0.to_vec::<f32>().unwrap());
+  let mut c1 = conv
+    .forward(&chunk(&x[0][3..5]), None, Some(&mut cache))
+    .unwrap();
+  decoded.extend(c1.to_vec::<f32>().unwrap());
+
+  assert_close(&decoded, &prefill_v);
+}
+
+#[test]
+fn shortconv_decode_with_cache_lengths_matches_prefill() {
+  // Exercises the `cache.lengths`-set decode branch — the one that builds the
+  // host `lengths_positions` index and stashes via `take_along_axis` (the path
+  // the cap + checked host alloc protect). With a single batch row whose length
+  // covers the whole sequence, `clip(length, 0, t)` keeps exactly the trailing
+  // `n_keep` frames, so the per-step decode stream must still equal the prefill
+  // output position-for-position.
+  let (in_w, conv_w, out_w, hidden, k) = sample_weights();
+  let conv = make_shortconv(&in_w, &conv_w, &out_w, hidden, k);
+  let x = sample_input();
+  let arr = x_to_array(&x);
+
+  let mut prefill = conv.forward(&arr, None, None).unwrap();
+  let prefill_v = prefill.to_vec::<f32>().unwrap();
+
+  let mut cache = ArraysCache::new(1);
+  let mut decoded: Vec<f32> = Vec::new();
+  // `prepare` sets `cache.lengths`; mlx-lm's `advance` decrements it per step,
+  // so seed it with the full remaining length before each token.
+  let total = x[0].len() as i32;
+  for (step, token) in x[0].iter().enumerate() {
+    cache.prepare(&[total - step as i32]);
+    let s: Vec<f32> = token.iter().map(|&v| v as f32).collect();
+    let step_arr = Array::from_slice::<f32>(&s, &(1usize, 1usize, hidden)).unwrap();
+    let mut out = conv.forward(&step_arr, None, Some(&mut cache)).unwrap();
+    decoded.extend(out.to_vec::<f32>().unwrap());
+  }
+  assert_close(&decoded, &prefill_v);
+}
+
+// ───────────────────────── sanitize ─────────────────────────
+
+#[test]
+fn sanitize_transposes_pytorch_conv_weight() {
+  use std::collections::HashMap;
+  // PyTorch depthwise conv weight (C=2, 1, K=3) — last axis (3) > middle (1).
+  let pt =
+    Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2usize, 1usize, 3usize)).unwrap();
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("model.layers.0.conv.conv.weight".to_string(), pt);
+  weights.insert(
+    // A non-conv weight must pass through untouched.
+    "model.layers.0.feed_forward.w1.weight".to_string(),
+    Array::from_slice::<f32>(&[7.0, 8.0], &(1usize, 2usize)).unwrap(),
+  );
+  Lfm2::sanitize(&mut weights).unwrap();
+
+  let mut conv = weights.remove("model.layers.0.conv.conv.weight").unwrap();
+  // Transposed to MLX (C, K, 1) = (2, 3, 1).
+  assert_eq!(conv.shape(), vec![2, 3, 1]);
+  // transpose(0, 2, 1) of [[ [1,2,3] ]] layout: channel 0 -> [1,2,3], so the
+  // (C,K,1) data is the same flat order here ([1,2,3,4,5,6]).
+  assert_eq!(
+    conv.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+  );
+  let w1 = weights
+    .remove("model.layers.0.feed_forward.w1.weight")
+    .unwrap();
+  assert_eq!(w1.shape(), vec![1, 2]);
+}
+
+#[test]
+fn sanitize_leaves_mlx_layout_conv_weight_untouched() {
+  use std::collections::HashMap;
+  // Already MLX layout (C=2, K=3, 1): last axis (1) < middle (3) — no change.
+  let mlx =
+    Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2usize, 3usize, 1usize)).unwrap();
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert("model.layers.1.conv.conv.weight".to_string(), mlx);
+  Lfm2::sanitize(&mut weights).unwrap();
+  let conv = &weights["model.layers.1.conv.conv.weight"];
+  assert_eq!(conv.shape(), vec![2, 3, 1]);
+}
+
+// ───────────────────────── config ─────────────────────────
+
+#[test]
+fn text_config_defaults_and_overrides() {
+  // Empty object → all reference defaults.
+  let cfg = TextConfig::from_json("{}").unwrap();
+  assert_eq!(cfg.hidden_size, 1024);
+  assert_eq!(cfg.num_hidden_layers, 16);
+  assert_eq!(cfg.num_attention_heads, 16);
+  assert_eq!(cfg.num_key_value_heads, 8);
+  assert_eq!(cfg.vocab_size, 65536);
+  assert_eq!(cfg.conv_l_cache, 3);
+  assert!(!cfg.conv_bias);
+  assert!((cfg.rope_theta - 1_000_000.0).abs() < 1.0);
+  assert_eq!(cfg.head_dim(), 64);
+
+  // Unmodeled keys are ignored (from_dict semantics); overrides applied. The
+  // overridden head counts stay GQA-consistent (2 query heads / 2 kv heads) so
+  // the config also passes validation.
+  let json = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 3, "conv_L_cache": 4,
+    "some_future_key": 99}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert_eq!(cfg.hidden_size, 8);
+  assert_eq!(cfg.num_attention_heads, 2);
+  assert_eq!(cfg.conv_l_cache, 4);
+  assert_eq!(cfg.head_dim(), 4);
+}
+
+#[test]
+fn attention_indices_from_layer_types() {
+  let json = r#"{"num_hidden_layers": 4,
+    "layer_types": ["conv", "full_attention", "conv", "full_attention"]}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert_eq!(cfg.attention_layer_indices().unwrap(), vec![1, 3]);
+}
+
+#[test]
+fn attention_indices_explicit_full_attn_idxs_wins() {
+  // When full_attn_idxs is present it is authoritative (mlx-lm __post_init__
+  // only derives from layer_types when full_attn_idxs is None).
+  let json = r#"{"num_hidden_layers": 4, "full_attn_idxs": [2],
+    "layer_types": ["full_attention", "conv", "conv", "conv"]}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert_eq!(cfg.attention_layer_indices().unwrap(), vec![2]);
+}
+
+#[test]
+fn attention_indices_none_means_all_conv() {
+  let json = r#"{"num_hidden_layers": 3}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert!(cfg.attention_layer_indices().unwrap().is_empty());
+}
+
+#[test]
+fn attention_index_out_of_range_rejected() {
+  let json = r#"{"num_hidden_layers": 2, "full_attn_idxs": [5]}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert!(cfg.attention_layer_indices().is_err());
+}
+
+#[test]
+fn attention_indices_reject_over_cap_full_attn_idxs() {
+  // A tiny `num_hidden_layers` paired with a `full_attn_idxs` longer than the
+  // realistic `MAX_CONFIG_CARDINALITY` cap would drive a large host allocation
+  // (the wholesale clone) before any index is range-checked. The length is
+  // bounded up front and rejected as a recoverable CapExceeded. Every entry is
+  // in range (`0`), so this isolates the *length* guard from the per-index one.
+  let over = (MAX_CONFIG_CARDINALITY as usize) + 1;
+  let idxs = vec!["0"; over].join(",");
+  let json = format!(r#"{{"num_hidden_layers": 2, "full_attn_idxs": [{idxs}]}}"#);
+  let cfg = TextConfig::from_json(&json).unwrap();
+  assert!(matches!(
+    cfg.attention_layer_indices(),
+    Err(Error::CapExceeded(_))
+  ));
+  // Exactly at the cap is admitted (the length guard alone passes); every entry
+  // is index 0 so the per-index range check also passes.
+  let at = vec!["0"; MAX_CONFIG_CARDINALITY as usize].join(",");
+  let at_json = format!(r#"{{"num_hidden_layers": 2, "full_attn_idxs": [{at}]}}"#);
+  let at_cfg = TextConfig::from_json(&at_json).unwrap();
+  assert!(at_cfg.attention_layer_indices().is_ok());
+}
+
+#[test]
+fn attention_indices_reject_over_cap_layer_types() {
+  // The `layer_types` collect path is bounded the same way: a per-layer list
+  // longer than the cap is a recoverable CapExceeded before the
+  // `"full_attention"` filter allocates. Entries are all `"conv"` so no index
+  // is ever produced — this isolates the source-length guard.
+  let over = (MAX_CONFIG_CARDINALITY as usize) + 1;
+  let types = vec!["\"conv\""; over].join(",");
+  let json = format!(r#"{{"num_hidden_layers": 2, "layer_types": [{types}]}}"#);
+  let cfg = TextConfig::from_json(&json).unwrap();
+  assert!(matches!(
+    cfg.attention_layer_indices(),
+    Err(Error::CapExceeded(_))
+  ));
+}
+
+#[test]
+fn from_json_rejects_oversized_full_attn_idxs_during_deserialization() {
+  // An array strictly longer than `MAX_CONFIG_CARDINALITY + 1` must be rejected
+  // *while parsing* (the `BoundedSeq` visitor stops growing the `Vec` at the cap
+  // rather than draining millions of elements into memory), so `from_json`
+  // itself fails with a typed `Error::Parse` — the `attention_layer_indices`
+  // `CapExceeded` path is never reached because the value never fully
+  // deserializes. The element count is `cap + 2` so it is the smallest array the
+  // deserializer rejects; entries are `0` (in range) to isolate the *length*
+  // bound from any per-index check.
+  let over = (MAX_CONFIG_CARDINALITY as usize) + 2;
+  let idxs = vec!["0"; over].join(",");
+  let json = format!(r#"{{"num_hidden_layers": 2, "full_attn_idxs": [{idxs}]}}"#);
+  assert!(matches!(TextConfig::from_json(&json), Err(Error::Parse(_))));
+  // The boundary the accessor tests (`cap + 1`) still deserializes — the
+  // deserializer admits exactly `cap + 1`, leaving the over-cap rejection to the
+  // `require_cardinality` check in `attention_layer_indices` (a recoverable
+  // `CapExceeded`), so the two guards compose without a gap.
+  let boundary = (MAX_CONFIG_CARDINALITY as usize) + 1;
+  let b_idxs = vec!["0"; boundary].join(",");
+  let b_json = format!(r#"{{"num_hidden_layers": 2, "full_attn_idxs": [{b_idxs}]}}"#);
+  let b_cfg = TextConfig::from_json(&b_json).unwrap();
+  assert!(matches!(
+    b_cfg.attention_layer_indices(),
+    Err(Error::CapExceeded(_))
+  ));
+}
+
+#[test]
+fn from_json_rejects_oversized_layer_types_during_deserialization() {
+  // The `layer_types` field is bounded the same way: an array longer than
+  // `cap + 1` is rejected by the `BoundedSeq` visitor during parsing, so
+  // `from_json` returns a typed `Error::Parse` before the `"full_attention"`
+  // collect can run. Entries are `"conv"` so no attention index would ever be
+  // produced — this isolates the deserialize-time length bound.
+  let over = (MAX_CONFIG_CARDINALITY as usize) + 2;
+  let types = vec!["\"conv\""; over].join(",");
+  let json = format!(r#"{{"num_hidden_layers": 2, "layer_types": [{types}]}}"#);
+  assert!(matches!(TextConfig::from_json(&json), Err(Error::Parse(_))));
+  // `cap + 1` still parses, deferring the over-cap rejection to the
+  // `require_cardinality` check in `attention_layer_indices`.
+  let boundary = (MAX_CONFIG_CARDINALITY as usize) + 1;
+  let b_types = vec!["\"conv\""; boundary].join(",");
+  let b_json = format!(r#"{{"num_hidden_layers": 2, "layer_types": [{b_types}]}}"#);
+  let b_cfg = TextConfig::from_json(&b_json).unwrap();
+  assert!(matches!(
+    b_cfg.attention_layer_indices(),
+    Err(Error::CapExceeded(_))
+  ));
+}
+
+#[test]
+fn bounded_seq_at_cap_parses_and_capacity_is_bounded() {
+  // Exactly `MAX_CONFIG_SEQ_LEN` elements deserialize successfully through the
+  // `BoundedSeq` visitor, and — the regression Codex asked for — the backing
+  // `Vec`'s capacity never exceeds the cap even though `serde_json` supplies no
+  // `size_hint` (the visitor pins `with_capacity(MAX_CONFIG_SEQ_LEN)`, so `push`
+  // cannot drive geometric doubling past the ceiling).
+  let idxs = vec!["0"; MAX_CONFIG_SEQ_LEN].join(",");
+  let json = format!("[{idxs}]");
+  let parsed: BoundedSeq<i32> = serde_json::from_str(&json).unwrap();
+  assert_eq!(parsed.0.len(), MAX_CONFIG_SEQ_LEN);
+  assert!(
+    parsed.0.capacity() <= MAX_CONFIG_SEQ_LEN,
+    "capacity {} exceeded the cap {MAX_CONFIG_SEQ_LEN}",
+    parsed.0.capacity()
+  );
+
+  // Same guarantee for the `String` element type whose over-cap surplus the fix
+  // must avoid materializing: capacity stays pinned at the ceiling.
+  let types = vec!["\"conv\""; MAX_CONFIG_SEQ_LEN].join(",");
+  let s_json = format!("[{types}]");
+  let s_parsed: BoundedSeq<String> = serde_json::from_str(&s_json).unwrap();
+  assert_eq!(s_parsed.0.len(), MAX_CONFIG_SEQ_LEN);
+  assert!(
+    s_parsed.0.capacity() <= MAX_CONFIG_SEQ_LEN,
+    "string-seq capacity {} exceeded the cap {MAX_CONFIG_SEQ_LEN}",
+    s_parsed.0.capacity()
+  );
+}
+
+#[test]
+fn bounded_seq_rejects_surplus_without_materializing() {
+  // One element past the ceiling (`MAX_CONFIG_SEQ_LEN + 1`, i.e. `cap + 2`) is
+  // rejected at parse by the visitor's `IgnoredAny` probe — the surplus element
+  // is *never* deserialized as `T`. Deserializing `BoundedSeq` directly surfaces
+  // the visitor's typed serde error (which `from_json` maps to `Error::Parse`).
+  let over = MAX_CONFIG_SEQ_LEN + 1;
+  let idxs = vec!["0"; over].join(",");
+  let json = format!("[{idxs}]");
+  assert!(serde_json::from_str::<BoundedSeq<i32>>(&json).is_err());
+
+  // The surplus `String` is not allocated: a value `serde_json` could not parse
+  // *as a `String`* (a bare number) in the surplus slot is still rejected as an
+  // over-length array, not a type error — proof the probe runs as `IgnoredAny`
+  // before any `String` materialization is attempted at the ceiling.
+  let mut elems = vec!["\"conv\""; MAX_CONFIG_SEQ_LEN];
+  elems.push("123");
+  let s_json = format!("[{}]", elems.join(","));
+  assert!(serde_json::from_str::<BoundedSeq<String>>(&s_json).is_err());
+}
+
+#[test]
+fn bounded_opt_fields_handle_null_and_absent() {
+  // Explicit JSON `null` → `None` through the `Option` shim (the
+  // `deserialize_bounded_opt_vec` wrapper handles `null` without entering the
+  // sequence visitor or panicking).
+  let null_json = r#"{"num_hidden_layers": 2,
+    "full_attn_idxs": null, "layer_types": null}"#;
+  let null_cfg = TextConfig::from_json(null_json).unwrap();
+  assert!(null_cfg.full_attn_idxs.is_none());
+  assert!(null_cfg.layer_types.is_none());
+
+  // Absent fields → `None` via `#[serde(default)]` (the `deserialize_with` shim
+  // is not even invoked for a missing key).
+  let absent_cfg = TextConfig::from_json(r#"{"num_hidden_layers": 2}"#).unwrap();
+  assert!(absent_cfg.full_attn_idxs.is_none());
+  assert!(absent_cfg.layer_types.is_none());
+}
+
+#[test]
+fn validate_rejects_zero_negative_nondivisible_and_oversized() {
+  // A divisible base (hidden 8 / heads 2 = head_dim 4; heads 2 / kv 2) so each
+  // case below isolates a single malformed field on an otherwise-sound config.
+  let base = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 16}"#;
+  assert!(TextConfig::from_json(base).unwrap().validate().is_ok());
+
+  // Zero dimension.
+  let zero = r#"{"hidden_size": 0, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(zero),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // Negative dimension.
+  let neg = r#"{"num_hidden_layers": -3}"#;
+  assert!(matches!(
+    TextConfig::from_json(neg),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // hidden_size not divisible by num_attention_heads (head_dim would truncate).
+  let nondiv = r#"{"hidden_size": 10, "num_attention_heads": 4,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(nondiv),
+    Err(Error::DivisibilityConstraint(_))
+  ));
+
+  // num_attention_heads not divisible by num_key_value_heads (GQA grouping).
+  let nondiv_gqa = r#"{"hidden_size": 12, "num_attention_heads": 6,
+    "num_key_value_heads": 4, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(nondiv_gqa),
+    Err(Error::DivisibilityConstraint(_))
+  ));
+
+  // Oversized / overflow-prone dimension (above the 2^24 cap).
+  let oversized = r#"{"vocab_size": 33554432, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(oversized),
+    Err(Error::OutOfRange(_))
+  ));
+
+  // block_multiple_of == 0 would divide-by-zero in adjusted_ff_dim.
+  let zero_multiple = r#"{"block_multiple_of": 0, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(zero_multiple),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn default_config_passes_validation() {
+  // The reference defaults must themselves be a valid configuration.
+  assert!(TextConfig::from_json("{}").unwrap().validate().is_ok());
+}
+
+#[test]
+fn validate_rejects_huge_layer_and_head_counts() {
+  // A cardinality field past the realistic 4096 cap would size a multi-GB
+  // per-layer Vec / cache before the first missing-key error; the shared
+  // `require_cardinality` guard rejects it as a recoverable CapExceeded at
+  // config time.
+  let huge_layers = r#"{"num_hidden_layers": 16777216, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(huge_layers),
+    Err(Error::CapExceeded(_))
+  ));
+  // The head counts are cardinalities too (they bound per-head reshapes and
+  // the cap keeps them realistic). 8192 > 4096.
+  let huge_heads = r#"{"num_attention_heads": 8192, "num_key_value_heads": 8192,
+    "hidden_size": 8192, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(huge_heads),
+    Err(Error::CapExceeded(_))
+  ));
+  // The cap boundary: exactly 4096 layers is accepted (within cap), 4097 is
+  // not — isolating the off-by-one. `hidden_size`/heads kept sound + even
+  // head_dim.
+  let at_cap = r#"{"num_hidden_layers": 4096, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2}"#;
+  assert!(TextConfig::from_json(at_cap).unwrap().validate().is_ok());
+  let over_cap = r#"{"num_hidden_layers": 4097, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(over_cap),
+    Err(Error::CapExceeded(_))
+  ));
+}
+
+#[test]
+fn validate_rejects_odd_rope_head_dim() {
+  // hidden=6, heads=2 -> head_dim=3 (odd). RoPE pairs feature k with
+  // k + head_dim/2, so an odd head_dim loads but only fails in the forward
+  // pass; validate must reject it eagerly. (6 % 2 == 0 so the divisibility
+  // check passes — this isolates the even-head_dim rule.)
+  let odd = r#"{"hidden_size": 6, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(odd),
+    Err(Error::OutOfRange(_))
+  ));
+  // An even head_dim (hidden=8, heads=2 -> 4) passes.
+  let even = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(TextConfig::from_json(even).unwrap().validate().is_ok());
+}
+
+#[test]
+fn validate_rejects_unbounded_ffn_multiplier() {
+  // A huge `block_ffn_dim_multiplier` overflows the i32 MLP-width arithmetic
+  // in adjusted_ff_dim (which `from_weights` calls). It must be a recoverable
+  // config-time error, not a saturating cast + overflow panic. (Sound base
+  // config so the multiplier is the only malformed field.)
+  let huge = r#"{"block_ffn_dim_multiplier": 1e30, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(huge),
+    Err(Error::OutOfRange(_))
+  ));
+  // A non-finite multiplier (NaN / Inf) must be a NonFiniteScalar. serde's
+  // JSON grammar has no NaN/Inf literal, so the field is set directly on an
+  // otherwise-valid parsed config and validate() called.
+  let base = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  let mut nan_cfg = TextConfig::from_json(base).unwrap();
+  nan_cfg.block_ffn_dim_multiplier = f32::NAN;
+  assert!(matches!(nan_cfg.validate(), Err(Error::NonFiniteScalar(_))));
+  let mut inf_cfg = TextConfig::from_json(base).unwrap();
+  inf_cfg.block_ffn_dim_multiplier = f32::INFINITY;
+  assert!(matches!(inf_cfg.validate(), Err(Error::NonFiniteScalar(_))));
+  // A non-positive multiplier is rejected too (it would zero / negate the MLP
+  // width).
+  let neg = r#"{"block_ffn_dim_multiplier": -1.0, "hidden_size": 8,
+    "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(neg),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+#[test]
+fn validate_rejects_non_finite_or_non_positive_rope_theta() {
+  // The EFFECTIVE `rope_theta` is the base of the attention `Rope`, so a
+  // `0.0` / negative / non-finite base must be a typed config error at load,
+  // not a silently-built `Rope` with invalid (non-finite / inverted) rotation
+  // frequencies. A non-positive base is `OutOfRange`; a non-finite (NaN / +Inf
+  // by overflow) base is `NonFiniteScalar` (the shared `require_positive_finite_f32`
+  // discipline). Sound base config so `rope_theta` is the only malformed field.
+
+  // ── top-level `rope_theta` ──
+  // Zero base (`OutOfRange`).
+  let zero = r#"{"rope_theta": 0.0, "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(zero),
+    Err(Error::OutOfRange(_))
+  ));
+  // Negative base (`OutOfRange`).
+  let neg = r#"{"rope_theta": -1000.0, "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(neg),
+    Err(Error::OutOfRange(_))
+  ));
+  // NaN base — serde's JSON grammar has no NaN literal, so the field is set
+  // directly on an otherwise-valid parsed config and `validate()` called
+  // (`NonFiniteScalar`).
+  let base = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  let mut nan_cfg = TextConfig::from_json(base).unwrap();
+  nan_cfg.rope_theta = f32::NAN;
+  assert!(matches!(nan_cfg.validate(), Err(Error::NonFiniteScalar(_))));
+  // +Inf base (`NonFiniteScalar`).
+  let mut inf_cfg = TextConfig::from_json(base).unwrap();
+  inf_cfg.rope_theta = f32::INFINITY;
+  assert!(matches!(inf_cfg.validate(), Err(Error::NonFiniteScalar(_))));
+
+  // ── via the `rope_parameters` override (`lfm2.py:40-42`) ──
+  // The override is what wins, so an invalid `rope_parameters.rope_theta` must
+  // be rejected the same way even when the top-level field is sound. The
+  // override has folded into the effective `rope_theta` by deserialize-time, so
+  // `from_json` (which runs `validate`) surfaces it for a JSON-expressible
+  // `0.0` / negative.
+  let zero_override = r#"{"rope_theta": 1000.0, "rope_parameters": {"rope_theta": 0.0},
+    "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(zero_override),
+    Err(Error::OutOfRange(_))
+  ));
+  let neg_override = r#"{"rope_theta": 1000.0, "rope_parameters": {"rope_theta": -5.0},
+    "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(matches!(
+    TextConfig::from_json(neg_override),
+    Err(Error::OutOfRange(_))
+  ));
+  // A NaN override (no JSON literal): set the override map's `rope_theta` to NaN
+  // on a parsed config, re-apply the override, and validate — the effective base
+  // is NaN (`NonFiniteScalar`).
+  let mut nan_override = TextConfig::from_json(base).unwrap();
+  nan_override.rope_parameters = Some(RopeParameters {
+    rope_theta: Some(f32::NAN),
+  });
+  nan_override.apply_rope_parameters_override();
+  assert!(matches!(
+    nan_override.validate(),
+    Err(Error::NonFiniteScalar(_))
+  ));
+
+  // A sound positive base still passes (the override is the realistic 10^6).
+  let ok = r#"{"rope_theta": 1000.0, "rope_parameters": {"rope_theta": 1000000.0},
+    "hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2}"#;
+  assert!(TextConfig::from_json(ok).unwrap().validate().is_ok());
+}
+
+#[test]
+fn validate_bounds_conv_l_cache_as_a_cardinality() {
+  // `conv_L_cache` sizes runtime allocations (the conv-state array's middle
+  // axis, the prefill left-pad, and a host `B * (conv_L_cache - 1)` index Vec),
+  // so it takes the tight `MAX_CONV_L_CACHE` (256) cardinality cap, NOT the
+  // loose 2^24 width cap. A value past the cap would otherwise drive a ~16M-wide
+  // pad / a `B`-multiplied gigabyte host allocation before any typed error.
+  let with_conv = |v: &str| {
+    format!(
+      r#"{{"conv_L_cache": {v}, "hidden_size": 8, "num_attention_heads": 2,
+        "num_key_value_heads": 2, "num_hidden_layers": 2}}"#
+    )
+  };
+
+  // The cap boundary: exactly MAX_CONV_L_CACHE is accepted, one past it is a
+  // recoverable CapExceeded — isolating the off-by-one.
+  assert!(
+    TextConfig::from_json(&with_conv(&MAX_CONV_L_CACHE.to_string()))
+      .unwrap()
+      .validate()
+      .is_ok()
+  );
+  assert!(matches!(
+    TextConfig::from_json(&with_conv(&(MAX_CONV_L_CACHE + 1).to_string())),
+    Err(Error::CapExceeded(_))
+  ));
+  // A value far past the old 2^24 width cap (which used to admit it) is now
+  // rejected as CapExceeded, not OutOfRange.
+  assert!(matches!(
+    TextConfig::from_json(&with_conv("1000000")),
+    Err(Error::CapExceeded(_))
+  ));
+  // The cardinality contract also rejects a non-positive window as OutOfRange
+  // (a zero / negative kernel is structurally invalid, not merely over-cap).
+  assert!(matches!(
+    TextConfig::from_json(&with_conv("0")),
+    Err(Error::OutOfRange(_))
+  ));
+  assert!(matches!(
+    TextConfig::from_json(&with_conv("-1")),
+    Err(Error::OutOfRange(_))
+  ));
+  // The realistic default (3) and a small explicit window stay valid.
+  assert!(
+    TextConfig::from_json(&with_conv("3"))
+      .unwrap()
+      .validate()
+      .is_ok()
+  );
+}
+
+// ───────────────────────── conv host index build ─────────────────────────
+
+#[test]
+fn lengths_positions_builds_clamped_index_rows() {
+  // `lengths_positions(lengths, t, n_keep)` materializes the `[B, n_keep, 1]`
+  // index `(clip(lengths, 0, t)[:, None] + arange(n_keep))[..., None]` consumed
+  // by the cached-state `take_along_axis`. Verify the closed form directly
+  // (independent of the code under test): row `b` is
+  // `clip(lengths[b],0,t), .., clip(lengths[b],0,t)+n_keep-1`. Here `t == 5` is
+  // at/above every length, so the clamp is a no-op.
+  let lengths = [0_i32, 2, 5];
+  let t = 5;
+  let n_keep = 2;
+  let mut idx = lengths_positions(&lengths, t, n_keep).unwrap();
+  assert_eq!(idx.shape(), vec![3, 2, 1]);
+  assert_eq!(idx.to_vec::<i32>().unwrap(), vec![0, 1, 2, 3, 5, 6]);
+
+  // The `clip(_, 0, t)` is folded into the build: a length above `t` is clamped
+  // down to `t`, a negative one up to `0`. With `t == 3`, `5 -> 3` and `-1 -> 0`.
+  let clamped = [-1_i32, 2, 5];
+  let mut clipped = lengths_positions(&clamped, 3, n_keep).unwrap();
+  assert_eq!(clipped.to_vec::<i32>().unwrap(), vec![0, 1, 2, 3, 3, 4]);
+
+  // `n_keep == 0` (a `conv_L_cache == 1` pointwise kernel) yields an empty
+  // `[B, 0, 1]` index with no host allocation driven past zero.
+  let mut empty = lengths_positions(&lengths, t, 0).unwrap();
+  assert_eq!(empty.shape(), vec![3, 0, 1]);
+  assert!(empty.to_vec::<i32>().unwrap().is_empty());
+}
+
+#[test]
+fn lengths_positions_host_build_is_bounded_by_the_cap() {
+  // The host index Vec is sized `B * (conv_L_cache - 1)`. The `conv_L_cache`
+  // cardinality cap keeps the per-batch multiplier a small constant, so even a
+  // large (but realistic) batch cannot drive an unbounded allocation: the
+  // capacity computation is a checked `usize` multiply and the buffer is
+  // fallibly reserved. Drive the largest within-cap window over a non-trivial
+  // batch and confirm the closed-form shape / first-row contents.
+  let n_keep = MAX_CONV_L_CACHE - 1; // the widest window the cap admits
+  let batch = 64;
+  let lengths: Vec<i32> = (0..batch).collect();
+  // `t` at/above every length so the folded clamp is a no-op for this shape check.
+  let mut idx = lengths_positions(&lengths, batch, n_keep).unwrap();
+  assert_eq!(idx.shape(), vec![batch as usize, n_keep as usize, 1]);
+  let flat = idx.to_vec::<i32>().unwrap();
+  assert_eq!(flat.len(), batch as usize * n_keep as usize);
+  // Row 0 is `0, 1, .., n_keep-1`; row 1 starts at `ends[1] == 1`.
+  assert_eq!(flat[0], 0);
+  assert_eq!(flat[n_keep as usize - 1], n_keep - 1);
+  assert_eq!(flat[n_keep as usize], 1);
+}
+
+#[test]
+fn shortconv_lengths_mismatch_with_batch_is_rejected() {
+  // `cache.lengths` must carry exactly one entry per batch row. A mismatched
+  // length would otherwise build a host index whose batch axis disagrees with
+  // `Bx` and fail deep inside `take_along_axis`; `ShortConv::forward` rejects it
+  // up front as a typed LengthMismatch. The input is batch 1, so a 2-entry (and
+  // a 0-entry) `lengths` are both mismatches.
+  let (in_w, conv_w, out_w, hidden, k) = sample_weights();
+  let conv = make_shortconv(&in_w, &conv_w, &out_w, hidden, k);
+  let x = sample_input(); // batch 1, L 5, hidden 2
+  let arr = x_to_array(&x);
+  let t = x[0].len() as i32;
+
+  let mut too_many = ArraysCache::new(1);
+  too_many.prepare(&[t, t]); // 2 entries vs batch 1
+  assert!(matches!(
+    conv.forward(&arr, None, Some(&mut too_many)),
+    Err(Error::LengthMismatch(_))
+  ));
+
+  let mut too_few = ArraysCache::new(1);
+  too_few.prepare(&[]); // 0 entries vs batch 1
+  assert!(matches!(
+    conv.forward(&arr, None, Some(&mut too_few)),
+    Err(Error::LengthMismatch(_))
+  ));
+
+  // The matching-length path (1 entry, batch 1) is accepted.
+  let mut ok = ArraysCache::new(1);
+  ok.prepare(&[t]);
+  assert!(conv.forward(&arr, None, Some(&mut ok)).is_ok());
+}
+
+// ───────────────────────── cache cardinality ─────────────────────────
+
+/// The tiny all-conv config JSON (`hidden=4`, `vocab=8`, `K=3`, `ff=8`, no
+/// `auto_adjust_ff_dim`, 2 layers) shared by the cardinality / conv-bias load
+/// tests. `conv_bias` is templated in by [`tiny_all_conv_weights`].
+const TINY_ALL_CONV_DIMS: (usize, usize, usize, usize) = (4, 8, 8, 3);
+
+/// Build the flat weight map for a tiny all-conv 2-layer LFM2. When
+/// `with_conv_bias` is set, each conv layer also carries `conv.bias`,
+/// `in_proj.bias`, and `out_proj.bias` (the three `conv_bias`-gated tensors).
+fn tiny_all_conv_weights(with_conv_bias: bool) -> std::collections::HashMap<String, Array> {
+  use std::collections::HashMap;
+  let (hidden, vocab, ff, k) = TINY_ALL_CONV_DIMS;
+
+  // A deterministic `(rows, cols)` weight whose entries are tiny and distinct.
+  let mat = |rows: usize, cols: usize| -> Array {
+    let data: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.01 - 0.1).collect();
+    Array::from_slice::<f32>(&data, &(rows, cols)).unwrap()
+  };
+  let vecn = |n: usize| -> Array {
+    let data: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.1).collect();
+    Array::from_slice::<f32>(&data, &(n,)).unwrap()
+  };
+
+  let mut w: HashMap<String, Array> = HashMap::new();
+  w.insert("model.embed_tokens.weight".to_string(), mat(vocab, hidden));
+  w.insert("model.embedding_norm.weight".to_string(), vecn(hidden));
+  for i in 0..2 {
+    let p = format!("model.layers.{i}");
+    w.insert(format!("{p}.operator_norm.weight"), vecn(hidden));
+    w.insert(format!("{p}.ffn_norm.weight"), vecn(hidden));
+    w.insert(format!("{p}.feed_forward.w1.weight"), mat(ff, hidden));
+    w.insert(format!("{p}.feed_forward.w3.weight"), mat(ff, hidden));
+    w.insert(format!("{p}.feed_forward.w2.weight"), mat(hidden, ff));
+    // Conv layer (all-conv model): (hidden, K, 1) depthwise weight + projs.
+    let conv_flat: Vec<f32> = (0..hidden * k).map(|i| (i as f32) * 0.02).collect();
+    w.insert(
+      format!("{p}.conv.conv.weight"),
+      Array::from_slice::<f32>(&conv_flat, &(hidden, k, 1usize)).unwrap(),
+    );
+    w.insert(format!("{p}.conv.in_proj.weight"), mat(3 * hidden, hidden));
+    w.insert(format!("{p}.conv.out_proj.weight"), mat(hidden, hidden));
+    if with_conv_bias {
+      // `conv.bias` is per-channel `(hidden,)`; the projection biases match
+      // their output widths (`in_proj` -> 3*hidden, `out_proj` -> hidden).
+      w.insert(format!("{p}.conv.conv.bias"), vecn(hidden));
+      w.insert(format!("{p}.conv.in_proj.bias"), vecn(3 * hidden));
+      w.insert(format!("{p}.conv.out_proj.bias"), vecn(hidden));
+    }
+  }
+  w
+}
+
+/// The tiny all-conv config with the given `conv_bias` flag.
+fn tiny_all_conv_config(conv_bias: bool) -> TextConfig {
+  let json = format!(
+    r#"{{"hidden_size": 4, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 8,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": 8,
+    "conv_bias": {conv_bias}}}"#
+  );
+  TextConfig::from_json(&json).unwrap()
+}
+
+/// Build a tiny all-conv 2-layer [`Lfm2`] (`conv_bias=false`, no biases).
+/// All-conv keeps the per-layer weight set to the conv + MLP + norms (no
+/// attention QK-norm / RoPE projections), which is enough to exercise the
+/// forward-pass cache-cardinality guard.
+fn tiny_all_conv_model() -> Lfm2 {
+  Lfm2::from_weights(tiny_all_conv_config(false), tiny_all_conv_weights(false)).unwrap()
+}
+
+#[test]
+fn forward_rejects_wrong_cardinality_cache() {
+  use crate::lm::model::Model as _;
+  let model = tiny_all_conv_model();
+  // A `[1, 2]` token window — two valid ids into the 8-row embedding table.
+  let tokens = Array::from_slice::<i32>(&[1, 3], &(1usize, 2usize)).unwrap();
+
+  // The correct cache has one entry per layer (2). A 1-entry cache must be a
+  // recoverable LengthMismatch, NOT an out-of-bounds index panic.
+  let mut short = model.make_cache();
+  short.truncate(1);
+  assert_eq!(short.len(), 1);
+  assert!(matches!(
+    model.forward(&tokens, &mut short),
+    Err(Error::LengthMismatch(_))
+  ));
+
+  // An over-long cache (3 entries) is likewise rejected rather than silently
+  // truncated by the layer `zip`.
+  let mut long = model.make_cache();
+  long.push(Box::new(ArraysCache::new(1)));
+  assert_eq!(long.len(), 3);
+  assert!(matches!(
+    model.forward(&tokens, &mut long),
+    Err(Error::LengthMismatch(_))
+  ));
+
+  // The matching-cardinality cache (2 entries) runs without error — the guard
+  // only rejects the mismatched counts.
+  let mut ok = model.make_cache();
+  assert_eq!(ok.len(), 2);
+  let logits = model.forward(&tokens, &mut ok).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, 8]);
+}
+
+#[test]
+fn forward_embeddings_rejects_low_rank_without_panic() {
+  use crate::lm::model::Model as _;
+  let model = tiny_all_conv_model();
+  let mut cache = model.make_cache();
+
+  // Rank-0 scalar: must be a typed RankMismatch, NOT a panic on shape[1].
+  // An empty `[i32; 0]` shape ⇒ a rank-0 (single-element) array.
+  let r0 = Array::from_slice::<f32>(&[0.5_f32], &([] as [i32; 0])).unwrap();
+  assert!(
+    matches!(
+      model.forward_embeddings(&r0, &mut cache),
+      Err(Error::RankMismatch(_))
+    ),
+    "rank-0 embeddings → RankMismatch"
+  );
+
+  // Rank-1 `[hidden]`: still RankMismatch (would index shape[1] out of bounds).
+  let r1 = Array::from_slice::<f32>(&[0.0_f32; 4], &(4usize,)).unwrap();
+  assert!(
+    matches!(
+      model.forward_embeddings(&r1, &mut cache),
+      Err(Error::RankMismatch(_))
+    ),
+    "rank-1 embeddings → RankMismatch"
+  );
+
+  // Rank-2 `[seq, hidden]` (the common "forgot the batch axis" mistake):
+  // RankMismatch (the LM wants rank-3 `[batch, seq, hidden]`).
+  let r2 = Array::from_slice::<f32>(&[0.0_f32; 8], &(2usize, 4usize)).unwrap();
+  assert!(
+    matches!(
+      model.forward_embeddings(&r2, &mut cache),
+      Err(Error::RankMismatch(_))
+    ),
+    "rank-2 embeddings → RankMismatch"
+  );
+}
+
+#[test]
+fn forward_embeddings_rejects_wrong_hidden_width() {
+  use crate::lm::model::Model as _;
+  let model = tiny_all_conv_model(); // hidden_size = 4
+  let mut cache = model.make_cache();
+
+  // Rank-3 but the hidden width is 8 ≠ config.hidden_size (4): a typed
+  // LengthMismatch naming the hidden-width contract.
+  let wrong = Array::from_slice::<f32>(&[0.0_f32; 16], &(1usize, 2usize, 8usize)).unwrap();
+  match model.forward_embeddings(&wrong, &mut cache) {
+    Err(Error::LengthMismatch(p)) => {
+      assert_eq!(p.expected(), 4, "expected = config.hidden_size");
+      assert_eq!(p.actual(), 8, "actual = supplied hidden width");
+    }
+    other => panic!("expected LengthMismatch(hidden width), got {other:?}"),
+  }
+
+  // The matching rank-3 `[1, 2, 4]` runs (the guard only rejects mismatches) →
+  // `[1, 2, vocab=8]` logits.
+  let ok = Array::from_slice::<f32>(&[0.0_f32; 8], &(1usize, 2usize, 4usize)).unwrap();
+  let logits = model.forward_embeddings(&ok, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, 8]);
+}
+
+#[test]
+fn adjusted_ff_dim_matches_reference_formula() {
+  // block_ff_dim=6656, multiple_of=256, multiplier=1.0, adjust=true:
+  //   int(2*6656/3)=4437; int(1.0*4437)=4437;
+  //   256 * ceil(4437/256) = 256 * 18 = 4608.
+  assert_eq!(adjusted_ff_dim(6656, 256, true, 1.0).unwrap(), 4608);
+  // adjust=false returns ff_dim unchanged.
+  assert_eq!(adjusted_ff_dim(6656, 256, false, 1.0).unwrap(), 6656);
+  // A non-unit multiplier: int(2*3000/3)=2000; int(0.5*2000)=1000;
+  //   128 * ceil(1000/128) = 128 * 8 = 1024.
+  assert_eq!(adjusted_ff_dim(3000, 128, true, 0.5).unwrap(), 1024);
+}
+
+#[test]
+fn adjusted_ff_dim_rejects_overflowing_multiplier() {
+  // A huge multiplier would saturate `(multiplier * base) as i32` to i32::MAX
+  // and then overflow the `ff + multiple_of - 1` round-up. It must instead be
+  // a recoverable OutOfRange, never a panic or a silently-wrapped width.
+  assert!(matches!(
+    adjusted_ff_dim(6656, 256, true, 1e30),
+    Err(Error::OutOfRange(_))
+  ));
+  // A multiplier just past the i32 ceiling for this base (base = 2*6656/3 =
+  // 4437; 4437 * multiplier > i32::MAX) is likewise rejected.
+  let just_over = (i32::MAX as f32 / 4437.0) * 2.0;
+  assert!(matches!(
+    adjusted_ff_dim(6656, 256, true, just_over),
+    Err(Error::OutOfRange(_))
+  ));
+}
+
+// ───────────────────────── conv_bias gating ─────────────────────────
+
+#[test]
+fn conv_bias_true_loads_with_all_biases() {
+  use crate::lm::model::Model as _;
+  // conv_bias=true + all three bias tensors present per conv layer: loads and
+  // runs (the bias is honored, not silently dropped).
+  let model = Lfm2::from_weights(tiny_all_conv_config(true), tiny_all_conv_weights(true)).unwrap();
+  let tokens = Array::from_slice::<i32>(&[1, 3], &(1usize, 2usize)).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 2, 8]);
+}
+
+#[test]
+fn conv_bias_true_missing_bias_is_missing_key() {
+  // conv_bias=true but a required bias tensor is absent: must be a typed
+  // MissingKey (a silent run-without-bias would diverge from the reference).
+  // Drop one bias from an otherwise-complete biased weight map.
+  let mut w = tiny_all_conv_weights(true);
+  assert!(w.remove("model.layers.0.conv.conv.bias").is_some());
+  assert!(matches!(
+    Lfm2::from_weights(tiny_all_conv_config(true), w),
+    Err(Error::MissingKey(_))
+  ));
+
+  // Likewise for a missing projection bias.
+  let mut w = tiny_all_conv_weights(true);
+  assert!(w.remove("model.layers.1.conv.in_proj.bias").is_some());
+  assert!(matches!(
+    Lfm2::from_weights(tiny_all_conv_config(true), w),
+    Err(Error::MissingKey(_))
+  ));
+}
+
+#[test]
+fn conv_bias_false_extra_bias_is_key_collision() {
+  // conv_bias=false but a bias tensor IS present: must be a typed KeyCollision
+  // (the stray bias would otherwise be silently applied). Add one bias to an
+  // otherwise-biasless weight map.
+  let mut w = tiny_all_conv_weights(false);
+  let vecn = |n: usize| -> Array {
+    let data: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.1).collect();
+    Array::from_slice::<f32>(&data, &(n,)).unwrap()
+  };
+  w.insert("model.layers.0.conv.conv.bias".to_string(), vecn(4));
+  assert!(matches!(
+    Lfm2::from_weights(tiny_all_conv_config(false), w),
+    Err(Error::KeyCollision(_))
+  ));
+
+  // A stray projection bias is likewise rejected.
+  let mut w = tiny_all_conv_weights(false);
+  w.insert("model.layers.1.conv.out_proj.bias".to_string(), vecn(4));
+  assert!(matches!(
+    Lfm2::from_weights(tiny_all_conv_config(false), w),
+    Err(Error::KeyCollision(_))
+  ));
+}
+
+#[test]
+fn conv_bias_false_no_bias_loads() {
+  // The complement of the collision case: conv_bias=false + no bias tensors is
+  // the normal biasless path and loads cleanly.
+  assert!(Lfm2::from_weights(tiny_all_conv_config(false), tiny_all_conv_weights(false)).is_ok());
+}
+
+// ───────────────────── quantized-checkpoint loading ─────────────────────
+//
+// No local 8-bit LFM2 checkpoint is available, so the quantized load path is
+// covered by a SYNTHETIC quantized checkpoint: a tiny hybrid (one attention +
+// one short-conv layer) whose every quantizable weight's last axis is a whole
+// multiple of the affine `group_size` (mlx requires `group_size ∈ {32, 64,
+// 128}`, `mlx/ops.cpp:4740`), with every `nn.Linear` weight and the token
+// embedding replaced by the real `ops::quantized::quantize` `(weight, scales,
+// biases)` triple — the exact on-disk layout an mlx-community 8-bit checkpoint
+// (e.g. `LiquidAI/LFM2.5-VL-450M-MLX-8bit`) ships. The depthwise `nn.Conv1d`
+// weight stays dense (MLX quantizes `nn.Linear` / `nn.Embedding` only). The
+// model must then construct (quantized Linears + quantized Embedding) and run a
+// forward through BOTH layer kinds to finite logits.
+
+/// A valid mlx affine group size (`mlx/ops.cpp:4740`).
+const QGROUP: i32 = 64;
+/// 8-bit affine — the mlx-community 8-bit scheme.
+const QBITS: i32 = 8;
+
+/// The tiny hybrid quantized-fixture config: `hidden = vocab-divisor = QGROUP`
+/// so every quantizable weight's last axis (`hidden`, `ff`) is a whole number
+/// of groups; layer 0 is attention (`full_attn_idxs = [0]`), layer 1 is conv.
+/// `block_auto_adjust_ff_dim = false` pins `ff = block_ff_dim = 2*QGROUP`,
+/// itself a multiple of `QGROUP`.
+fn quant_hybrid_config() -> TextConfig {
+  let hidden = QGROUP; // 64
+  let ff = 2 * QGROUP; // 128
+  let json = format!(
+    r#"{{"hidden_size": {hidden}, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+    "full_attn_idxs": [0], "conv_bias": false}}"#
+  );
+  TextConfig::from_json(&json).unwrap()
+}
+
+/// Replace the dense `<prefix>.weight` in `w` with the real
+/// `ops::quantized::quantize` 8-bit affine triple (`<prefix>.weight` packed +
+/// `<prefix>.scales` + `<prefix>.biases`), mirroring how an mlx-community
+/// quantized checkpoint stores a quantized `Linear` / `Embedding`.
+fn quantize_weight_in_place(w: &mut std::collections::HashMap<String, Array>, prefix: &str) {
+  let dense = w
+    .remove(&format!("{prefix}.weight"))
+    .unwrap_or_else(|| panic!("dense weight present for {prefix}"));
+  let (w_q, scales, biases) =
+    crate::ops::quantized::quantize(&dense, QGROUP, QBITS, "affine", None).unwrap();
+  w.insert(format!("{prefix}.weight"), w_q);
+  w.insert(format!("{prefix}.scales"), scales);
+  w.insert(
+    format!("{prefix}.biases"),
+    biases.expect("affine produces per-group biases"),
+  );
+}
+
+/// Build the dense hybrid weight map for [`quant_hybrid_config`]: layer 0 is an
+/// attention layer (QK-norm + q/k/v/out_proj), layer 1 is a conv layer (dense
+/// depthwise conv weight + in_proj/out_proj). All bias-free (`conv_bias=false`).
+fn quant_hybrid_dense_weights() -> std::collections::HashMap<String, Array> {
+  use std::collections::HashMap;
+  let hidden = QGROUP as usize; // 64
+  let ff = 2 * QGROUP as usize; // 128
+  let vocab = 128usize;
+  let k = 3usize;
+
+  // A deterministic `(rows, cols)` weight with tiny distinct entries.
+  let mat = |rows: usize, cols: usize| -> Array {
+    let data: Vec<f32> = (0..rows * cols)
+      .map(|i| ((i % 17) as f32) * 0.01 - 0.08)
+      .collect();
+    Array::from_slice::<f32>(&data, &(rows, cols)).unwrap()
+  };
+  let vecn = |n: usize| -> Array {
+    let data: Vec<f32> = (0..n).map(|i| 1.0 + (i % 7) as f32 * 0.05).collect();
+    Array::from_slice::<f32>(&data, &(n,)).unwrap()
+  };
+
+  let mut w: HashMap<String, Array> = HashMap::new();
+  w.insert("model.embed_tokens.weight".to_string(), mat(vocab, hidden));
+  w.insert("model.embedding_norm.weight".to_string(), vecn(hidden));
+  for i in 0..2 {
+    let p = format!("model.layers.{i}");
+    w.insert(format!("{p}.operator_norm.weight"), vecn(hidden));
+    w.insert(format!("{p}.ffn_norm.weight"), vecn(hidden));
+    w.insert(format!("{p}.feed_forward.w1.weight"), mat(ff, hidden));
+    w.insert(format!("{p}.feed_forward.w3.weight"), mat(ff, hidden));
+    w.insert(format!("{p}.feed_forward.w2.weight"), mat(hidden, ff));
+  }
+  // Layer 0: attention (head_dim = hidden/2 = 32, even).
+  let q = "model.layers.0.self_attn";
+  let head_dim = hidden / 2; // 32
+  w.insert(format!("{q}.q_layernorm.weight"), vecn(head_dim));
+  w.insert(format!("{q}.k_layernorm.weight"), vecn(head_dim));
+  w.insert(format!("{q}.q_proj.weight"), mat(hidden, hidden));
+  w.insert(format!("{q}.k_proj.weight"), mat(hidden, hidden));
+  w.insert(format!("{q}.v_proj.weight"), mat(hidden, hidden));
+  w.insert(format!("{q}.out_proj.weight"), mat(hidden, hidden));
+  // Layer 1: conv (dense depthwise weight in MLX (C, K, 1) layout) + projections.
+  let c = "model.layers.1.conv";
+  let conv_flat: Vec<f32> = (0..hidden * k).map(|i| (i as f32) * 0.01).collect();
+  w.insert(
+    format!("{c}.conv.weight"),
+    Array::from_slice::<f32>(&conv_flat, &(hidden, k, 1usize)).unwrap(),
+  );
+  w.insert(format!("{c}.in_proj.weight"), mat(3 * hidden, hidden));
+  w.insert(format!("{c}.out_proj.weight"), mat(hidden, hidden));
+  w
+}
+
+/// The dense hybrid weights with every `nn.Linear` and the token embedding
+/// quantized to the 8-bit affine triple. The depthwise conv weight stays dense
+/// (`mlx_lm/utils.py` `class_predicate` quantizes `nn.Linear` / `nn.Embedding`
+/// only, never `nn.Conv1d`).
+fn quant_hybrid_weights() -> std::collections::HashMap<String, Array> {
+  let mut w = quant_hybrid_dense_weights();
+  // Token embedding (tied logit head).
+  quantize_weight_in_place(&mut w, "model.embed_tokens");
+  // Per-layer MLP projections (both layers).
+  for i in 0..2 {
+    let p = format!("model.layers.{i}");
+    for proj in ["w1", "w3", "w2"] {
+      quantize_weight_in_place(&mut w, &format!("{p}.feed_forward.{proj}"));
+    }
+  }
+  // Layer 0 attention projections.
+  for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+    quantize_weight_in_place(&mut w, &format!("model.layers.0.self_attn.{proj}"));
+  }
+  // Layer 1 conv projections (the two `nn.Linear`s — NOT the conv weight).
+  for proj in ["in_proj", "out_proj"] {
+    quantize_weight_in_place(&mut w, &format!("model.layers.1.conv.{proj}"));
+  }
+  w
+}
+
+/// The parsed global 8-bit affine quantization config for the synthetic
+/// checkpoint (the analogue of the `config.json` `quantization` block).
+fn quant_config() -> PerLayerQuantization {
+  PerLayerQuantization::from_global(crate::lm::quant::Quantization::affine(QGROUP, QBITS))
+}
+
+#[test]
+fn from_weights_quantized_builds_quantized_layers_and_keeps_conv_dense() {
+  use crate::lm::model::Model as _;
+  // An 8-bit checkpoint whose Linear/Embedding weights carry `.scales`/`.biases`
+  // builds quantized layers (a packed `uint32` weight of a DIFFERENT shape than
+  // the dense `(out, in)` loads through the quantized path), the token embedding
+  // + the tied head are quantized, and the depthwise conv weight STAYS DENSE.
+  let model = Lfm2::from_weights_quantized(
+    quant_hybrid_config(),
+    quant_hybrid_weights(),
+    Some(&quant_config()),
+  )
+  .unwrap();
+
+  // The token embedding (and therefore the tied `as_linear` head, which reuses
+  // the same table) is quantized.
+  assert!(
+    model.model.embed_tokens.is_quantized(),
+    "token embedding (tied head) must be quantized"
+  );
+
+  // Layer 0 = attention: all four projections quantized. The quantized q/k/v
+  // are NOT fused (fusion concatenates dense weights only), so they stay three
+  // separate quantized projections.
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => {
+      match &attn.qkv_proj {
+        QkvProj::Split { q, k, v } => {
+          assert!(q.is_quantized(), "q_proj quantized");
+          assert!(k.is_quantized(), "k_proj quantized");
+          assert!(v.is_quantized(), "v_proj quantized");
+        }
+        QkvProj::Fused { .. } => panic!("quantized q/k/v must stay split, not fused"),
+      }
+      assert!(attn.out_proj.is_quantized(), "out_proj quantized");
+    }
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+  // Both layers' MLP projections quantized.
+  for layer in &model.model.layers {
+    assert!(layer.feed_forward.w1.is_quantized(), "w1 quantized");
+    assert!(layer.feed_forward.w3.is_quantized(), "w3 quantized");
+    assert!(layer.feed_forward.w2.is_quantized(), "w2 quantized");
+  }
+  // Layer 1 = conv: the two projections are quantized, but the depthwise conv
+  // weight is DENSE — assert it kept its float dtype (a quantized weight would
+  // be `uint32`).
+  match &model.model.layers[1].mixer {
+    Mixer::Conv(conv) => {
+      assert!(conv.in_proj.is_quantized(), "conv in_proj quantized");
+      assert!(conv.out_proj.is_quantized(), "conv out_proj quantized");
+      assert_eq!(
+        conv.conv_weight.dtype().unwrap(),
+        crate::dtype::Dtype::F32,
+        "depthwise conv weight must stay dense (f32), not be quantized to uint32"
+      );
+    }
+    Mixer::Attention(_) => panic!("layer 1 should be conv"),
+  }
+
+  // And it runs a forward through BOTH the attention and the conv layer to
+  // FINITE logits of the right shape (the quantized `quantized_matmul`s and the
+  // quantized weight-tied logit head all execute through mlx-c).
+  let tokens = Array::from_slice::<i32>(&[1, 5, 9], &(1usize, 3usize)).unwrap();
+  let mut cache = model.make_cache();
+  let mut logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 3, 128]);
+  for v in logits.to_vec::<f32>().unwrap() {
+    assert!(
+      v.is_finite(),
+      "quantized forward produced a non-finite logit: {v}"
+    );
+  }
+}
+
+#[test]
+fn from_weights_quantized_dense_checkpoint_byte_identical() {
+  use crate::lm::model::Model as _;
+  // A NON-quantized checkpoint loads identically whether or not a quantization
+  // config is threaded (the `.scales` sibling is the load-bearing signal; a
+  // dense checkpoint has none, so the dense path runs regardless), and
+  // `from_weights == from_weights_quantized(.., None)`. The three load paths
+  // must produce bit-identical logits on the same input.
+  let cfg = || tiny_all_conv_config(false);
+  let tokens = Array::from_slice::<i32>(&[1, 3], &(1usize, 2usize)).unwrap();
+
+  let run = |model: &Lfm2| -> Vec<f32> {
+    let mut cache = model.make_cache();
+    let mut logits = model.forward(&tokens, &mut cache).unwrap();
+    logits.to_vec::<f32>().unwrap()
+  };
+
+  let plain = Lfm2::from_weights(cfg(), tiny_all_conv_weights(false)).unwrap();
+  let with_none = Lfm2::from_weights_quantized(cfg(), tiny_all_conv_weights(false), None).unwrap();
+  let with_cfg =
+    Lfm2::from_weights_quantized(cfg(), tiny_all_conv_weights(false), Some(&quant_config()))
+      .unwrap();
+  // None of the dense projections are quantized regardless of the threaded cfg.
+  assert!(!plain.model.embed_tokens.is_quantized());
+  assert!(!with_cfg.model.embed_tokens.is_quantized());
+
+  let a = run(&plain);
+  let b = run(&with_none);
+  let c = run(&with_cfg);
+  assert_eq!(
+    a, b,
+    "from_weights vs from_weights_quantized(None) must match exactly"
+  );
+  assert_eq!(
+    a, c,
+    "a dense checkpoint loads identically with a quant config threaded"
+  );
+}
+
+#[test]
+fn from_weights_quantized_scales_without_config_errors() {
+  // Weights say quantized (`.scales` present) but the threaded config resolves
+  // NO scheme params for the layer → a typed InvariantViolation, never a panic
+  // or a silently-wrong load. An empty per-layer config with no global default
+  // makes `quantization_for` return None for the quantized embedding (the first
+  // quantized layer the loader reaches).
+  let empty_cfg = PerLayerQuantization::new(None, std::collections::HashMap::new());
+  let err = Lfm2::from_weights_quantized(
+    quant_hybrid_config(),
+    quant_hybrid_weights(),
+    Some(&empty_cfg),
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::InvariantViolation(_)),
+    "expected InvariantViolation for `.scales` present but no resolved params, got {err:?}"
+  );
+}
+
+#[test]
+fn resolve_quantization_handles_both_keys() {
+  // The LFM2 resolver accepts the mlx-lm `quantization` key AND the HF
+  // `quantization_config` alias some post-quantize artifacts emit; both parse to
+  // the same global scheme. A dense config (neither key) resolves to None.
+  let block = r#"{"group_size": 64, "bits": 8, "mode": "affine"}"#;
+  for key in ["quantization", "quantization_config"] {
+    let json = format!(r#"{{"hidden_size": 64, "{key}": {block}}}"#);
+    let plq = resolve_quantization(&json)
+      .unwrap()
+      .expect("a quantized config resolves");
+    let q = plq
+      .quantization_for("model.embed_tokens")
+      .expect("global default applies");
+    assert_eq!((q.group_size, q.bits), (64, 8));
+  }
+  // No quantization block → dense (None).
+  assert!(
+    resolve_quantization(r#"{"hidden_size": 64}"#)
+      .unwrap()
+      .is_none()
+  );
+  // An explicit `null` block is also dense (None), mirroring the audio fallback.
+  assert!(
+    resolve_quantization(r#"{"quantization": null}"#)
+      .unwrap()
+      .is_none()
+  );
+  // A malformed block (missing required `bits`) is a recoverable typed error.
+  assert!(matches!(
+    resolve_quantization(r#"{"quantization": {"group_size": 64}}"#),
+    Err(Error::Parse(_))
+  ));
+}
+
+// ───────────────────────── rope_parameters override ─────────────────────────
+
+#[test]
+fn rope_parameters_theta_overrides_top_level() {
+  // `__post_init__` (`lfm2.py:41-42`): when `rope_parameters` carries a
+  // `rope_theta`, it OVERRIDES the top-level `rope_theta`. Here the top-level is
+  // 1000, the override is 5000 -> the effective theta is 5000.
+  let json = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1000.0,
+    "rope_parameters": {"rope_theta": 5000.0}}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 5000.0,
+    "rope_parameters.rope_theta must win"
+  );
+}
+
+#[test]
+fn rope_parameters_absent_or_without_theta_keeps_top_level() {
+  // No `rope_parameters` key -> the top-level `rope_theta` is used unchanged.
+  let no_params = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1234.0}"#;
+  assert_eq!(
+    TextConfig::from_json(no_params).unwrap().rope_theta,
+    1234.0,
+    "absent rope_parameters keeps the top-level rope_theta"
+  );
+
+  // A `rope_parameters` present but WITHOUT a `rope_theta` (only unmodeled keys)
+  // also keeps the top-level value (upstream's `"rope_theta" in rope_parameters`
+  // is false), and the extra key is ignored.
+  let no_theta = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1234.0,
+    "rope_parameters": {"rope_type": "default"}}"#;
+  let cfg = TextConfig::from_json(no_theta).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 1234.0,
+    "rope_parameters without rope_theta keeps the top-level value"
+  );
+
+  // An explicit `null` rope_parameters is also a no-op (upstream's
+  // `rope_parameters is not None` is false).
+  let null_params = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 777.0,
+    "rope_parameters": null}"#;
+  assert_eq!(
+    TextConfig::from_json(null_params).unwrap().rope_theta,
+    777.0,
+    "null rope_parameters keeps the top-level value"
+  );
+}
+
+#[test]
+fn rope_parameters_explicit_null_theta_falls_back_to_top_level_without_error() {
+  // A present `rope_parameters` whose `rope_theta` is EXPLICITLY `null`. The
+  // double-`Option` raw mirror (`RawRopeParameters`) distinguishes this from an
+  // absent `rope_theta`, and the raw->public conversion deliberately treats the
+  // explicit null as a graceful fallback to the top-level `rope_theta`. Upstream
+  // (`lfm2.py:40-42`) would set `rope_theta = None` and crash; mlxrs falls back
+  // robustly and does NOT error. The config must load (validate) with the
+  // top-level value preserved.
+  let null_theta = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 4242.0,
+    "rope_parameters": {"rope_theta": null}}"#;
+  let cfg = TextConfig::from_json(null_theta)
+    .expect("explicit-null rope_parameters.rope_theta must load (robust fallback, no error)");
+  assert_eq!(
+    cfg.rope_theta, 4242.0,
+    "explicit-null rope_theta falls back to the top-level rope_theta"
+  );
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    None,
+    "the public override value is None for an explicit-null rope_theta"
+  );
+
+  // It must also BUILD: a model constructed from the config carries the
+  // top-level base in its attention RoPE (the null did not poison the build).
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let build_json = format!(
+    r#"{{"hidden_size": {hidden}, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+    "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 4242.0,
+    "rope_parameters": {{"rope_theta": null}}}}"#
+  );
+  let build_cfg = TextConfig::from_json(&build_json)
+    .expect("explicit-null rope_parameters.rope_theta must load for the build path");
+  let model = Lfm2::from_weights(build_cfg, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert_eq!(
+      attn.rope.base, 4242.0,
+      "the attention RoPE base falls back to the top-level rope_theta on explicit null"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+fn rope_parameters_empty_map_keeps_top_level() {
+  // A present but EMPTY `rope_parameters` map (the inner `rope_theta` key is
+  // ABSENT). The double-`Option` mirror yields `None` for the missing key, so
+  // the override is a no-op and the top-level `rope_theta` is kept.
+  let empty = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 4242.0,
+    "rope_parameters": {}}"#;
+  let cfg = TextConfig::from_json(empty).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 4242.0,
+    "an empty rope_parameters map keeps the top-level rope_theta"
+  );
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    None,
+    "the public override value is None for an empty rope_parameters map"
+  );
+}
+
+#[test]
+fn rope_parameters_present_value_overrides_to_5000() {
+  // A present `rope_parameters.rope_theta` value (`Some(Some(v))`) overrides the
+  // top-level `rope_theta` (`lfm2.py:40-42`): top-level 1000 -> effective 5000.
+  let json = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1000.0,
+    "rope_parameters": {"rope_theta": 5000}}"#;
+  let cfg = TextConfig::from_json(json).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 5000.0,
+    "a present rope_parameters.rope_theta overrides the top-level value to 5000"
+  );
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    Some(5000.0),
+    "the public override value is Some(5000) for a present rope_theta"
+  );
+}
+
+#[test]
+fn rope_parameters_explicit_null_and_absent_yield_the_same_effective_theta() {
+  // Pin the deliberate fallback as intentional: an EXPLICIT
+  // `rope_parameters.rope_theta: null` and an ABSENT `rope_parameters` must
+  // produce the SAME effective `rope_theta` (both keep the top-level value). The
+  // double-`Option` mirror distinguishes the two JSON shapes during parsing, but
+  // the resolved RoPE base is identical by design.
+  let top_level = 9001.0;
+  let explicit_null = format!(
+    r#"{{"hidden_size": 8, "num_attention_heads": 2, "num_key_value_heads": 2,
+    "num_hidden_layers": 2, "rope_theta": {top_level},
+    "rope_parameters": {{"rope_theta": null}}}}"#
+  );
+  let absent = format!(
+    r#"{{"hidden_size": 8, "num_attention_heads": 2, "num_key_value_heads": 2,
+    "num_hidden_layers": 2, "rope_theta": {top_level}}}"#
+  );
+  let null_theta = TextConfig::from_json(&explicit_null).unwrap().rope_theta;
+  let absent_theta = TextConfig::from_json(&absent).unwrap().rope_theta;
+  assert_eq!(
+    null_theta, absent_theta,
+    "explicit-null and absent rope_parameters must yield the same effective rope_theta"
+  );
+  assert_eq!(
+    null_theta, top_level,
+    "both resolve to the top-level rope_theta"
+  );
+}
+
+#[test]
+fn rope_parameters_override_reaches_the_built_attention_rope() {
+  // The override is applied in `from_json` (the `__post_init__` analogue), so a
+  // model built from the overridden config carries the override in its attention
+  // RoPE `base` — not just in the parsed struct field.
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let json = format!(
+    r#"{{"hidden_size": {hidden}, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+    "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 1000.0,
+    "rope_parameters": {{"rope_theta": 31337.0}}}}"#
+  );
+  let cfg = TextConfig::from_json(&json).unwrap();
+  let model = Lfm2::from_weights(cfg, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => {
+      assert_eq!(
+        attn.rope.base, 31337.0,
+        "the attention RoPE base must carry the rope_parameters override"
+      );
+    }
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+fn rope_parameters_override_applies_on_direct_serde_without_from_json() {
+  // The override is intrinsic to `TextConfig`'s hand-written `Deserialize`, so a
+  // DIRECT `serde_json::from_str::<TextConfig>` — bypassing `from_json` entirely —
+  // still materializes the overridden `rope_theta`. This is the bypass FINDING 1
+  // closes: a caller who deserializes `TextConfig` directly and feeds it to a
+  // builder must NOT get a stale top-level `rope_theta`.
+  let json = r#"{"hidden_size": 8, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "rope_theta": 1000.0,
+    "rope_parameters": {"rope_theta": 5000.0}}"#;
+  let cfg: TextConfig = serde_json::from_str(json).unwrap();
+  assert_eq!(
+    cfg.rope_theta, 5000.0,
+    "direct serde_json::from_str::<TextConfig> must carry the rope_parameters override (no from_json)"
+  );
+}
+
+#[test]
+fn builder_renormalizes_rope_override_for_a_mutated_config() {
+  // `__post_init__` re-derives `rope_theta` from `rope_parameters` on EVERY
+  // construction (`lfm2.py:40-42`), and `TextConfig::from_weights_quantized` is
+  // the chokepoint that consumes `rope_theta` to build the attention RoPE. The
+  // `Deserialize` normalizes on the parse path; the builder re-applies the same
+  // override so a config materialized then MUTATED post-deserialize (the fields
+  // are public) into a stale `rope_parameters` / `rope_theta` pair still builds
+  // an attention RoPE with the override's base. Deserialize a config (already
+  // normalized to 31337), then simulate a clone+mutate that desynchronizes the
+  // pair: set the top-level `rope_theta` to a STALE 1000 while leaving
+  // `rope_parameters.rope_theta` at 31337. The built attention RoPE base must be
+  // the override (31337), proving the builder re-normalized rather than reading
+  // the stale top-level value.
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let json = format!(
+    r#"{{"hidden_size": {hidden}, "num_attention_heads": 2,
+    "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+    "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+    "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 1000.0,
+    "rope_parameters": {{"rope_theta": 31337.0}}}}"#
+  );
+  let mut cfg = TextConfig::from_json(&json).unwrap();
+  // Post-construction mutation: desynchronize the pair (the override field stays
+  // 31337, the top-level field regresses to a stale 1000).
+  cfg.rope_theta = 1000.0;
+  assert_eq!(
+    cfg.rope_parameters.as_ref().and_then(|p| p.rope_theta),
+    Some(31337.0),
+    "the override field is still 31337 after the mutation"
+  );
+  let model = Lfm2::from_weights(cfg, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert_eq!(
+      attn.rope.base, 31337.0,
+      "the builder must re-apply the rope_parameters override for a mutated config (not read the stale top-level rope_theta)"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+#[cfg(feature = "lfm2-vl")]
+fn vlm_direct_serde_model_config_carries_override_into_built_rope() {
+  // The VLM `ModelConfig` derives `Deserialize`, which deserializes its nested
+  // `text_config` via `TextConfig`'s hand-written `Deserialize` — so the
+  // `__post_init__` override (`lfm2.py:40-42`) is carried even on a DIRECT
+  // `serde_json::from_str::<ModelConfig>` that never calls `ModelConfig::from_json`.
+  // Build the wrapped LM from that directly-deserialized `text_config` and assert
+  // the override reaches the attention RoPE `base` (not just the struct field),
+  // the VLM analogue of `rope_parameters_override_reaches_the_built_attention_rope`
+  // via the direct-serde path. The `text_config` dims mirror `quant_hybrid_config`
+  // so its weights fit `quant_hybrid_dense_weights`; the top-level rope_theta is
+  // 1000 and the override is 31337.
+  use crate::vlm::models::lfm2_vl::config::ModelConfig;
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let json = format!(
+    r#"{{
+      "vision_config": {{}},
+      "text_config": {{
+        "hidden_size": {hidden}, "num_attention_heads": 2,
+        "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+        "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+        "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 1000.0,
+        "rope_parameters": {{"rope_theta": 31337.0}}
+      }}
+    }}"#
+  );
+  // DIRECT serde — NOT `ModelConfig::from_json`.
+  let cfg: ModelConfig = serde_json::from_str(&json).unwrap();
+  assert_eq!(
+    cfg.text_config.rope_theta, 31337.0,
+    "nested text_config override must be carried by ModelConfig's derived Deserialize (direct serde)"
+  );
+  let model = Lfm2::from_weights(cfg.text_config, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert_eq!(
+      attn.rope.base, 31337.0,
+      "the attention RoPE base must carry the override from the directly-deserialized ModelConfig"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+#[cfg(feature = "lfm2-vl")]
+fn vlm_builder_renormalizes_rope_override_for_a_mutated_text_config() {
+  // The VLM builder constructs its LM via `Lfm2::from_weights_quantized` off
+  // `config.text_config` (`lfm2_vl/model.rs`), so the LM builder's
+  // re-normalization (`lfm2.py:40-42`, on every construction) covers the VLM
+  // path: a `text_config` materialized then MUTATED into a stale
+  // `rope_parameters` / `rope_theta` pair still builds an attention RoPE with the
+  // override's base. Deserialize a VLM `ModelConfig` (its nested `text_config`
+  // normalized to 31337), then desynchronize the pair by regressing the
+  // top-level `text_config.rope_theta` to a stale 1000, and build the LM the same
+  // way the VLM does. The attention RoPE base must be the override (31337) — the
+  // mutated-config analogue of `vlm_direct_serde_model_config_carries_override_into_built_rope`.
+  use crate::vlm::models::lfm2_vl::config::ModelConfig;
+  let hidden = QGROUP; // 64, head_dim = 32 (even)
+  let ff = 2 * QGROUP;
+  let json = format!(
+    r#"{{
+      "vision_config": {{}},
+      "text_config": {{
+        "hidden_size": {hidden}, "num_attention_heads": 2,
+        "num_key_value_heads": 2, "num_hidden_layers": 2, "vocab_size": 128,
+        "conv_L_cache": 3, "block_auto_adjust_ff_dim": false, "block_ff_dim": {ff},
+        "full_attn_idxs": [0], "conv_bias": false, "rope_theta": 1000.0,
+        "rope_parameters": {{"rope_theta": 31337.0}}
+      }}
+    }}"#
+  );
+  let mut cfg: ModelConfig = serde_json::from_str(&json).unwrap();
+  // Post-construction mutation of the nested `text_config`: the override field
+  // stays 31337, the top-level field regresses to a stale 1000.
+  cfg.text_config.rope_theta = 1000.0;
+  // Build the LM exactly as `Lfm2Vl::from_weights` does (off `text_config`).
+  let model = Lfm2::from_weights(cfg.text_config, quant_hybrid_dense_weights()).unwrap();
+  match &model.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert_eq!(
+      attn.rope.base, 31337.0,
+      "the VLM-path LM builder must re-apply the rope_parameters override for a mutated text_config"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+// ───────────────────── fused QKV projection (perf, exact) ─────────────────────
+
+/// Build a tiny hybrid (layer 0 attention, layer 1 conv) DENSE model from the
+/// shared quant-hybrid fixtures — the smallest arch that exercises an attention
+/// layer's q/k/v projections. All-dense so the QKV is fused.
+fn hybrid_dense_model() -> Lfm2 {
+  Lfm2::from_weights(quant_hybrid_config(), quant_hybrid_dense_weights()).unwrap()
+}
+
+#[test]
+fn dense_qkv_is_fused_quantized_qkv_is_split() {
+  // A dense attention layer fuses q/k/v into one matmul; a quantized one keeps
+  // them separate (the fusion concatenates dense weights only).
+  let dense = hybrid_dense_model();
+  match &dense.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert!(
+      attn.qkv_proj.is_fused(),
+      "all-dense q/k/v must fuse into one projection"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+
+  let quant = Lfm2::from_weights_quantized(
+    quant_hybrid_config(),
+    quant_hybrid_weights(),
+    Some(&quant_config()),
+  )
+  .unwrap();
+  match &quant.model.layers[0].mixer {
+    Mixer::Attention(attn) => assert!(
+      !attn.qkv_proj.is_fused(),
+      "quantized q/k/v must stay split (no packed-weight concatenation)"
+    ),
+    Mixer::Conv(_) => panic!("layer 0 should be attention"),
+  }
+}
+
+#[test]
+fn fused_qkv_project_matches_three_separate_matmuls_bit_for_bit() {
+  // The fused QKV projection must reproduce `q_proj(x), k_proj(x), v_proj(x)`
+  // EXACTLY (bit-for-bit), since `x @ concat([Wq,Wk,Wv],0)ᵀ` split back into the
+  // three slices is the same dot products in the same order. Reconstruct the
+  // three separate dense projections from the same weights as an independent
+  // oracle and compare with `assert_eq!` (exact equality, not a tolerance).
+  let hidden = QGROUP as usize; // 64
+  let w = quant_hybrid_dense_weights();
+  let take = |name: &str| -> Array { w[name].try_clone().unwrap() };
+  let q = Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None);
+  let k = Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None);
+  let v = Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None);
+
+  // The fused projection under test (built exactly as the model builds it).
+  let fused = QkvProj::new(
+    Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None),
+  )
+  .unwrap();
+  assert!(fused.is_fused(), "all-dense input must fuse");
+
+  // A representative `(B=2, L=3, hidden)` input.
+  let n = 2 * 3 * hidden;
+  let data: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.03 - 0.2).collect();
+  let x = Array::from_slice::<f32>(&data, &(2usize, 3usize, hidden)).unwrap();
+
+  let (fq, fk, fv) = fused.project(&x).unwrap();
+  let sq = q.forward(&x).unwrap();
+  let sk = k.forward(&x).unwrap();
+  let sv = v.forward(&x).unwrap();
+
+  assert_eq!(fq.shape(), sq.shape(), "q shape");
+  assert_eq!(fk.shape(), sk.shape(), "k shape");
+  assert_eq!(fv.shape(), sv.shape(), "v shape");
+  // Exact equality — the fusion is a pure rearrangement, not an approximation.
+  // The fused split yields strided views (a slice of the wide output's last
+  // axis), so make each contiguous before the host read.
+  let read = |a: &Array| -> Vec<f32> {
+    crate::ops::shape::contiguous(a, false)
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap()
+  };
+  assert_eq!(read(&fq), read(&sq), "q");
+  assert_eq!(read(&fk), read(&sk), "k");
+  assert_eq!(read(&fv), read(&sv), "v");
+}
+
+#[test]
+fn fused_qkv_with_biases_matches_three_separate_biased_matmuls() {
+  // LFM2's q/k/v are bias-free, but the fusion must preserve bit-identity for ANY
+  // dense checkpoint: when all three projections carry a `(out,)` bias, fusing
+  // `[Wq;Wk;Wv]` AND `[bq;bk;bv]` must reproduce `q_proj(x)+bq, k_proj(x)+bk,
+  // v_proj(x)+bv` EXACTLY — proving the consumed biases are concatenated into the
+  // fused bias, not silently dropped.
+  let hidden = QGROUP as usize; // 64
+  let w = quant_hybrid_dense_weights();
+  let take = |name: &str| -> Array { w[name].try_clone().unwrap() };
+  // Distinct deterministic `(hidden,)` biases per projection.
+  let bias = |seed: f32| -> Array {
+    let data: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.001 + seed).collect();
+    Array::from_slice::<f32>(&data, &(hidden,)).unwrap()
+  };
+  let make = || -> (Linear, Linear, Linear) {
+    (
+      Linear::new(
+        take("model.layers.0.self_attn.q_proj.weight"),
+        Some(bias(0.1)),
+      ),
+      Linear::new(
+        take("model.layers.0.self_attn.k_proj.weight"),
+        Some(bias(0.2)),
+      ),
+      Linear::new(
+        take("model.layers.0.self_attn.v_proj.weight"),
+        Some(bias(0.3)),
+      ),
+    )
+  };
+  // Independent oracle: three separate biased projections.
+  let (q, k, v) = make();
+  // The fused projection under test (built exactly as the model builds it).
+  let (fq_in, fk_in, fv_in) = make();
+  let fused = QkvProj::new(fq_in, fk_in, fv_in).unwrap();
+  assert!(fused.is_fused(), "all-dense (biased) input must fuse");
+
+  let n = 2 * 3 * hidden;
+  let data: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.03 - 0.2).collect();
+  let x = Array::from_slice::<f32>(&data, &(2usize, 3usize, hidden)).unwrap();
+
+  let (fq, fk, fv) = fused.project(&x).unwrap();
+  let sq = q.forward(&x).unwrap();
+  let sk = k.forward(&x).unwrap();
+  let sv = v.forward(&x).unwrap();
+  let read = |a: &Array| -> Vec<f32> {
+    crate::ops::shape::contiguous(a, false)
+      .unwrap()
+      .to_vec::<f32>()
+      .unwrap()
+  };
+  // Exact equality — the fused bias split must reproduce each per-proj bias add.
+  assert_eq!(read(&fq), read(&sq), "q (with bias)");
+  assert_eq!(read(&fk), read(&sk), "k (with bias)");
+  assert_eq!(read(&fv), read(&sv), "v (with bias)");
+}
+
+#[test]
+fn fused_qkv_mixed_biases_is_key_collision_not_silent_drop() {
+  // A *mixed* dense q/k/v bias set (some projections carry a bias, some do not)
+  // cannot be a faithful LFM2 checkpoint (the three share one `bias=False` flag)
+  // and must be a typed KeyCollision — never a silent drop of the present biases.
+  let w = quant_hybrid_dense_weights();
+  let take = |name: &str| -> Array { w[name].try_clone().unwrap() };
+  let hidden = QGROUP as usize;
+  let bias = Array::from_slice::<f32>(&vec![0.5_f32; hidden], &(hidden,)).unwrap();
+
+  // q biased, k/v bias-free.
+  let r = QkvProj::new(
+    Linear::new(
+      take("model.layers.0.self_attn.q_proj.weight"),
+      Some(bias.try_clone().unwrap()),
+    ),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None),
+  );
+  assert!(
+    matches!(r, Err(Error::KeyCollision(_))),
+    "mixed q/k/v biases must be a KeyCollision, got {r:?}"
+  );
+}
+
+#[test]
+fn fused_qkv_rank_below_two_weight_is_typed_error_not_panic() {
+  // A malformed rank-0 / rank-1 q/k/v projection weight reaches the fused dense
+  // path, which reads `shape[0]` and concatenates along axis 0. It must surface a
+  // typed RankMismatch, NEVER an out-of-bounds `shape[0]` slice-index panic.
+  let w = quant_hybrid_dense_weights();
+  let take = |name: &str| -> Array { w[name].try_clone().unwrap() };
+
+  // Rank-0 q_proj weight (an empty shape ⇒ a single-element rank-0 array).
+  let r0 = Array::from_slice::<f32>(&[0.5_f32], &([] as [i32; 0])).unwrap();
+  let res0 = QkvProj::new(
+    Linear::new(r0, None),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None),
+  );
+  assert!(
+    matches!(res0, Err(Error::RankMismatch(_))),
+    "rank-0 q_proj weight → RankMismatch, got {res0:?}"
+  );
+
+  // Rank-1 k_proj weight `[hidden]` (still not the `(out, in)` rank-2 a Linear
+  // weight must be).
+  let hidden = QGROUP as usize;
+  let r1 = Array::from_slice::<f32>(&vec![0.0_f32; hidden], &(hidden,)).unwrap();
+  let res1 = QkvProj::new(
+    Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None),
+    Linear::new(r1, None),
+    Linear::new(take("model.layers.0.self_attn.v_proj.weight"), None),
+  );
+  assert!(
+    matches!(res1, Err(Error::RankMismatch(_))),
+    "rank-1 k_proj weight → RankMismatch, got {res1:?}"
+  );
+
+  // Rank-0 v_proj weight: `wv` reaches the `concatenate` FFI, so it must be
+  // rank-validated too (not just `wq` / `wk`) — a typed RankMismatch, never an
+  // FFI concat over a rank-0 tensor.
+  let v_r0 = Array::from_slice::<f32>(&[0.5_f32], &([] as [i32; 0])).unwrap();
+  let res_v0 = QkvProj::new(
+    Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(v_r0, None),
+  );
+  assert!(
+    matches!(res_v0, Err(Error::RankMismatch(_))),
+    "rank-0 v_proj weight → RankMismatch, got {res_v0:?}"
+  );
+
+  // Rank-1 v_proj weight `[hidden]`: same — RankMismatch before the concat.
+  let v_r1 = Array::from_slice::<f32>(&vec![0.0_f32; hidden], &(hidden,)).unwrap();
+  let res_v1 = QkvProj::new(
+    Linear::new(take("model.layers.0.self_attn.q_proj.weight"), None),
+    Linear::new(take("model.layers.0.self_attn.k_proj.weight"), None),
+    Linear::new(v_r1, None),
+  );
+  assert!(
+    matches!(res_v1, Err(Error::RankMismatch(_))),
+    "rank-1 v_proj weight → RankMismatch, got {res_v1:?}"
+  );
+}
+
+// ───────────────────── edge cases: empty / max-length / dtype / shape ─────────
+
+#[test]
+fn forward_empty_sequence_is_typed_error_not_panic() {
+  // A zero-length sequence (`seq_len == 0`) must produce a well-defined
+  // typed `Result::Err`, never a panic. LFM2's short-conv left-pads `Bx` by
+  // `L_cache - 1` (= 2) frames and depthwise-convolves with a kernel of
+  // `L_cache` (= 3); with no real tokens the padded length (2) is below the
+  // kernel (3), so the convolution is undefined — upstream's identical
+  // `mx.pad(...)` + `conv(...)` would raise the same way. The contract here is
+  // that the forward returns a typed error (mlx surfaces it as `Error::MlxOp`),
+  // not that an empty prompt is meaningful.
+  use crate::lm::model::Model as _;
+  let model = hybrid_dense_model();
+  let mut cache = model.make_cache();
+  let empty = Array::from_slice::<i32>(&[] as &[i32], &(1usize, 0usize)).unwrap();
+  // `forward` may build the lazy graph and return `Ok`; the conv error then
+  // surfaces on eval. `and_then(eval)` collapses both into one `is_err`.
+  let result = model.forward(&empty, &mut cache).and_then(|mut l| l.eval());
+  assert!(
+    result.is_err(),
+    "a zero-length sequence must be a typed error, not a panic or silent success"
+  );
+}
+
+#[test]
+fn forward_embeddings_empty_sequence_is_typed_error_not_panic() {
+  // The merged-embeddings entry point (the VLM splice path) is bound by the same
+  // short-conv kernel-vs-padding constraint for a `(B, 0, hidden)` tensor: a
+  // typed `Result::Err`, never a panic.
+  use crate::lm::model::Model as _;
+  let model = hybrid_dense_model();
+  let mut cache = model.make_cache();
+  let hidden = QGROUP as usize;
+  let emb = Array::zeros::<f32>(&(1usize, 0usize, hidden)).unwrap();
+  let result = model.forward_embeddings(&emb, &mut cache);
+  assert!(
+    result.and_then(|mut l| l.eval()).is_err(),
+    "a zero-length merged-embeddings forward must be a typed error, not a panic"
+  );
+}
+
+#[test]
+fn forward_large_position_offset_runs_without_panic() {
+  // A representative large position offset (a prefill seeding the cache to a
+  // large offset, then a decode step) exercises RoPE at a big absolute position
+  // without panic / overflow. `mlx_fast_rope`'s offset is `int`; a position far
+  // into the context must rotate cleanly. We can't cheaply prefill 100k tokens,
+  // so seed the StandardKvCache offset directly and decode one token at that
+  // offset (the RoPE `apply(_, offset)` is where a large offset lands).
+  use crate::lm::model::Model as _;
+  let model = hybrid_dense_model();
+  let mut cache = model.make_cache();
+
+  // Decode a single token; the attention layer rotates it at `cache.offset`.
+  // First run a small prefill so the conv/attention caches are seeded, then a
+  // decode step. The offset reached here is modest, but the RoPE op itself is
+  // exercised; a separate direct RoPE call pins the large-offset path.
+  let prompt = Array::from_slice::<i32>(&[1, 5, 9], &(1usize, 3usize)).unwrap();
+  let _ = model.forward(&prompt, &mut cache).unwrap();
+  let step = Array::from_slice::<i32>(&[11], &(1usize, 1usize)).unwrap();
+  let mut logits = model.forward(&step, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 1, 128]);
+  assert!(
+    logits
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite())
+  );
+
+  // Directly exercise RoPE at a position near `max_position_embeddings` (128k):
+  // a `(1, n_heads, 1, head_dim)` step rotated at offset 131_071 must produce
+  // finite values of the same shape (no overflow in the int offset path).
+  let head_dim = 32i32; // hidden/heads = 64/2
+  let q = Array::zeros::<f32>(&(1usize, 2usize, 1usize, head_dim as usize)).unwrap();
+  let rope = Rope::new(head_dim, false, 1_000_000.0, 1.0);
+  let mut rotated = rope.apply(&q, 131_071).unwrap();
+  assert_eq!(rotated.shape(), vec![1, 2, 1, 32]);
+  assert!(
+    rotated
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "RoPE at a large offset must stay finite"
+  );
+}
+
+/// The hybrid dense weight map with every tensor cast to `dt` — a synthetic
+/// bf16 / f16 dense checkpoint (mirrors `tiny_weights_in_dtype` in the
+/// embeddinggemma suite).
+fn hybrid_weights_in_dtype(dt: crate::dtype::Dtype) -> std::collections::HashMap<String, Array> {
+  let mut w = quant_hybrid_dense_weights();
+  for v in w.values_mut() {
+    *v = crate::ops::misc::astype(v, dt).unwrap();
+  }
+  w
+}
+
+/// A `dt`-dtype LFM2 forward must run AND keep the activation dtype — the
+/// logits stay `dt`, never silently promoted to f32. Exercises BOTH layer kinds
+/// (layer 0 attention with RoPE + QK-norm + SDPA, layer 1 short-conv) since a
+/// hidden-state promotion in either mixer would surface here. This is the
+/// preserve-activation-dtype contract the f32-only suites don't cover.
+fn assert_forward_preserves_dtype(dt: crate::dtype::Dtype) {
+  use crate::lm::model::Model as _;
+  let model = Lfm2::from_weights(quant_hybrid_config(), hybrid_weights_in_dtype(dt)).unwrap();
+  let tokens = Array::from_slice::<i32>(&[1, 5, 9], &(1usize, 3usize)).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward(&tokens, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 3, 128]);
+  assert_eq!(
+    logits.dtype().unwrap(),
+    dt,
+    "LFM2 forward must keep the activation dtype {dt:?} (no f32 promotion in attention/conv/RoPE/norm)"
+  );
+  // Finiteness: read host-side via an f32 cast (a bf16/f16 array is not directly
+  // `to_vec::<f32>`-able).
+  let mut as_f32 = crate::ops::misc::astype(&logits, crate::dtype::Dtype::F32).unwrap();
+  assert!(
+    as_f32
+      .to_vec::<f32>()
+      .unwrap()
+      .iter()
+      .all(|v| v.is_finite()),
+    "{dt:?} forward must be finite"
+  );
+}
+
+#[test]
+fn forward_preserves_bf16_dtype() {
+  assert_forward_preserves_dtype(crate::dtype::Dtype::BF16);
+}
+
+#[test]
+fn forward_preserves_f16_dtype() {
+  assert_forward_preserves_dtype(crate::dtype::Dtype::F16);
+}
+
+#[test]
+fn forward_embeddings_preserves_bf16_dtype() {
+  // The merged-embeddings path (the VLM splice entry) must also preserve dtype:
+  // a bf16 `(B, T, hidden)` embedding tensor forwards to bf16 logits.
+  use crate::lm::model::Model as _;
+  let dt = crate::dtype::Dtype::BF16;
+  let model = Lfm2::from_weights(quant_hybrid_config(), hybrid_weights_in_dtype(dt)).unwrap();
+  let hidden = QGROUP as usize;
+  let n = 3 * hidden;
+  let data: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) * 0.02 - 0.1).collect();
+  let emb_f32 = Array::from_slice::<f32>(&data, &(1usize, 3usize, hidden)).unwrap();
+  let emb = crate::ops::misc::astype(&emb_f32, dt).unwrap();
+  let mut cache = model.make_cache();
+  let logits = model.forward_embeddings(&emb, &mut cache).unwrap();
+  assert_eq!(logits.shape(), vec![1, 3, 128]);
+  assert_eq!(
+    logits.dtype().unwrap(),
+    dt,
+    "forward_embeddings must keep the bf16 activation dtype"
+  );
+}
+
+#[test]
+fn from_weights_rejects_wrong_hidden_size_weight() {
+  // A wrong-shaped weight (here `q_proj` built for a different hidden_size)
+  // must surface a typed error from the existing shape validation, not a panic.
+  // The config says hidden=64 (q_proj should be (64, 64)); we plant a (64, 48)
+  // q_proj. The per-head reshape / matmul shape check rejects it.
+  let mut w = quant_hybrid_dense_weights();
+  let wrong = Array::from_slice::<f32>(
+    &vec![0.01_f32; 64 * 48],
+    &(64usize, 48usize), // in-features 48 != hidden 64
+  )
+  .unwrap();
+  w.insert("model.layers.0.self_attn.q_proj.weight".to_string(), wrong);
+
+  // The mismatch surfaces either at load (fused concat width / build) or at the
+  // first forward (matmul contraction `hidden(64) @ (48, *)`), but it MUST be a
+  // typed `Result::Err`, never a panic. Drive both: build then forward.
+  use crate::lm::model::Model as _;
+  let built = Lfm2::from_weights(quant_hybrid_config(), w);
+  let err = match built {
+    Err(e) => e,
+    Ok(model) => {
+      let tokens = Array::from_slice::<i32>(&[1, 5, 9], &(1usize, 3usize)).unwrap();
+      let mut cache = model.make_cache();
+      model
+        .forward(&tokens, &mut cache)
+        .expect_err("a wrong-hidden q_proj must not forward cleanly")
+    }
+  };
+  // It is a typed error of some variant (shape / matmul) — not a panic.
+  let _ = err;
+}

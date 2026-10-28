@@ -1,0 +1,1212 @@
+//! Streaming inference session — orchestrates
+//! [`super::mel_spectrogram::IncrementalMelSpectrogram`] +
+//! [`super::encoder::StreamingEncoder`] + a per-architecture decoder to
+//! produce a [`super::types::TranscriptionEvent`] stream.
+//!
+//! Faithful port of
+//! [`mlx-audio-swift/Sources/MLXAudioSTT/Streaming/StreamingInferenceSession.swift`][swift-ref]
+//! adapted to mlxrs's synchronous foreground-only execution model:
+//!
+//! - The Swift reference launches `Task.detached { ... runDecodePass
+//!   ... }` per pass and yields events into an
+//!   `AsyncStream<TranscriptionEvent>`. mlxrs runs each decode pass
+//!   synchronously on the caller's thread; events are returned as a
+//!   batch (`Vec<TranscriptionEvent>`) from
+//!   [`StreamingInferenceSession::feed_audio`] and
+//!   [`StreamingInferenceSession::stop`].
+//! - The Swift reference depends on the concrete `Qwen3ASRModel`
+//!   (`audioTower`, `tokenizer`, `mergeAudioFeatures`, `buildPrompt`,
+//!   `makeCache`, `callAsFunction`). mlxrs replaces that with the
+//!   [`StreamingDecoderBackend`] trait every per-architecture model
+//!   implements — same orchestration loop, no concrete model in the
+//!   port.
+//! - The Swift session uses Apple's `OSAllocatedUnfairLock` + tokenizer
+//!   protocol. mlxrs uses owned `&mut self` (single-threaded session) +
+//!   a [`StreamingTokenizer`] trait the caller supplies.
+//!
+//! The promotion / agreement / boundary-boost logic mirrors the Swift
+//! reference at-line: a token is promoted to confirmed when it has been
+//! seen for `>= min_agreement_passes` consecutive decode passes AND has
+//! survived for `>= delay_preset.delay_ms()`. When a full encoder window
+//! completes (or
+//! [`super::types::StreamingConfig::finalize_completed_windows`] is on
+//! and the boundary fast cadence elapses) the session promotes the
+//! current provisional run, finalizes the window's text, and resets
+//! decode state for the next window.
+//!
+//! # Retry contract
+//!
+//! `feed_audio` and `stop` are both **retryable on `Err`**. The session
+//! uses a unified internal retry-state machine that tracks exactly
+//! which fallible stage owes the next call its retry: mel-flush,
+//! encoder-feed-of-stop-tail, the same-call decode for already-committed
+//! bridge-drained windows, the finalize-queue drain, or `stop()`'s
+//! post-finalize partial-window decode. Each fallible stage either
+//! fully commits or sets a resume-point that names exactly where the
+//! next call must resume.
+//!
+//! An earlier design split the same retry plumbing across 3 separate
+//! session fields plus per-call locals, where one of those fields
+//! could desync from the others on a partial-failure path; the unified
+//! state machine kills the defect class structurally — no per-call
+//! locals, one source of truth for "what work is owed across the call
+//! boundary."
+//!
+//! [swift-ref]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioSTT/Streaming/StreamingInferenceSession.swift
+
+use std::time::Instant;
+
+use super::{
+  encoder::{StreamingEncoder, StreamingEncoderBackend},
+  mel_spectrogram::IncrementalMelSpectrogram,
+  retry_state::SessionRetryState,
+  types::{StreamingConfig, StreamingStats, TranscriptionEvent},
+};
+use crate::{
+  Array,
+  error::{LayerKeyedPayload, Result},
+};
+
+/// Architecture-specific per-pass decoder bridge.
+///
+/// Implementors wrap the per-model audio-decoder forward pass (the
+/// Swift reference's `buildPrompt` + `mergeAudioFeatures` + KV-cache +
+/// auto-regressive sampling loop). The session calls
+/// [`StreamingDecoderBackend::decode_all_tokens`] once per pass.
+///
+/// All state mutation is local to the implementor — the session never
+/// constructs / inspects KV caches, so per-model cache lifetime stays
+/// inside per-model code.
+///
+/// `confirmed_token_ids` is the seed prefix the decoder should
+/// re-replay before sampling new tokens (lets the cache warm up
+/// without re-running the audio encoder). The returned `Vec<u32>` is
+/// the **full** token sequence (confirmed prefix + newly sampled
+/// tail). Implementors that don't need the replay-replay-then-sample
+/// optimization can ignore `confirmed_token_ids` and return only the
+/// newly sampled tokens with `confirmed_token_ids` prepended; the
+/// session uses `confirmed_token_ids.len()` as the split point.
+pub trait StreamingDecoderBackend {
+  /// Run one decode pass over `audio_features`, returning the full
+  /// token-id sequence (confirmed seed + newly sampled tokens).
+  ///
+  /// `max_tokens` is the caller's per-pass budget — implementations
+  /// MUST stop sampling at this count even if EOS hasn't been
+  /// reached, to bound per-pass latency.
+  ///
+  /// # Errors
+  /// Implementation-defined — surfaced via [`Result`].
+  fn decode_all_tokens(
+    &self,
+    audio_features: &Array,
+    confirmed_token_ids: &[u32],
+    config: &StreamingConfig,
+    max_tokens: usize,
+  ) -> Result<Vec<u32>>;
+}
+
+/// Architecture-specific tokenizer bridge for streaming detok.
+///
+/// The session only needs to convert id-slices to display text
+/// incrementally — it never encodes. Per-model code typically wires
+/// this through [`crate::tokenizer::sentencepiece::SentencePieceTokenizer`]
+/// or the [`crate::tokenizer::Tokenizer`] HF wrapper.
+pub trait StreamingTokenizer {
+  /// Decode an id sequence to displayable text.
+  fn decode_ids(&self, ids: &[u32]) -> String;
+}
+
+/// Streaming-decode pending state, mirroring Swift's
+/// `SessionSharedState`. Owned by the session (no lock — single-thread
+/// access).
+#[derive(Debug, Default)]
+struct SessionSharedState {
+  /// Accumulated text from completed encoder windows — frozen, never
+  /// re-decoded.
+  completed_text: String,
+  /// Confirmed-prefix tokens for the current pending window.
+  confirmed_token_ids: Vec<u32>,
+  /// Provisional tail under agreement-tracking.
+  provisional_token_ids: Vec<u32>,
+  /// First-seen `Instant` per provisional token — drives the
+  /// `delay_ms` promotion clock.
+  provisional_first_seen: Vec<Instant>,
+  /// Per-provisional consecutive agreement counters.
+  provisional_agreement_counts: Vec<usize>,
+  /// Display string for the confirmed prefix.
+  confirmed_text: String,
+}
+
+/// Per-decode-pass parameter bundle. Lets the helper functions stay
+/// small and avoids cloning the session into every call.
+struct DecodePassParams<'a> {
+  audio_features: &'a Array,
+  confirmed_token_ids: Vec<u32>,
+  display_prefix: String,
+  prev_provisional: Vec<u32>,
+  prev_first_seen: Vec<Instant>,
+  prev_agreement_counts: Vec<usize>,
+  min_agreement_passes: usize,
+}
+
+/// Synchronous streaming-STT orchestration session.
+///
+/// Generic over the per-architecture encoder backend `B`, decoder
+/// backend `D`, and tokenizer `T`. Owns its own
+/// [`IncrementalMelSpectrogram`] + [`StreamingEncoder`] + an internal
+/// retry-state machine.
+pub struct StreamingInferenceSession<B, D, T> {
+  decoder: D,
+  tokenizer: T,
+  config: StreamingConfig,
+
+  mel_processor: IncrementalMelSpectrogram,
+  encoder: StreamingEncoder<B>,
+
+  shared: SessionSharedState,
+  is_active: bool,
+  total_samples_fed: usize,
+  last_decode_time: Option<Instant>,
+  boundary_fast_decode_until: Option<Instant>,
+  has_new_encoder_content: bool,
+  /// Number of encoder windows whose text has been frozen into
+  /// `completed_text`.
+  frozen_window_count: usize,
+  /// Unified retry-state machine — the single source of truth for any
+  /// in-flight retry obligation across `feed_audio` / `stop` calls.
+  /// Replaces an earlier trio of session fields
+  /// (`pending_finalize_queue`, `pending_stop_mel_frames`,
+  /// `pending_bridge_drain_decode`) + per-call locals. See
+  /// [`super::retry_state`] for the discharge protocol.
+  retry_state: SessionRetryState,
+}
+
+impl<B, D, T> StreamingInferenceSession<B, D, T>
+where
+  B: StreamingEncoderBackend,
+  D: StreamingDecoderBackend,
+  T: StreamingTokenizer,
+{
+  /// Build a new session. `sample_rate` and `n_mels` describe the
+  /// mel-extractor configuration that the encoder backend expects;
+  /// `overlap_frames` is the encoder window's cross-window overlap
+  /// in mel frames (matches Swift's `overlapFrames`). Per the Swift
+  /// reference, `n_fft = 400` and `hop_length = 160` are fixed for
+  /// the streaming mel extractor.
+  ///
+  /// # Errors
+  /// Propagates from [`IncrementalMelSpectrogram::new`].
+  pub fn new(
+    decoder: D,
+    tokenizer: T,
+    config: StreamingConfig,
+    encoder_backend: B,
+    sample_rate: u32,
+    n_mels: usize,
+    overlap_frames: usize,
+  ) -> Result<Self> {
+    let mel_processor = IncrementalMelSpectrogram::new(sample_rate, 400, 160, n_mels)?;
+    let max_cached_windows = config.max_cached_windows();
+    let encoder = StreamingEncoder::new(encoder_backend, max_cached_windows, overlap_frames);
+    Ok(Self {
+      decoder,
+      tokenizer,
+      config,
+      mel_processor,
+      encoder,
+      shared: SessionSharedState::default(),
+      is_active: true,
+      total_samples_fed: 0,
+      last_decode_time: None,
+      boundary_fast_decode_until: None,
+      has_new_encoder_content: false,
+      frozen_window_count: 0,
+      retry_state: SessionRetryState::new(),
+    })
+  }
+
+  /// Borrow the underlying [`StreamingConfig`].
+  #[inline(always)]
+  pub fn config(&self) -> &StreamingConfig {
+    &self.config
+  }
+
+  /// Total samples fed since construction / last [`reset`](Self::reset).
+  #[inline(always)]
+  pub fn total_samples_fed(&self) -> usize {
+    self.total_samples_fed
+  }
+
+  /// Number of fully encoded windows.
+  #[inline(always)]
+  pub fn encoded_window_count(&self) -> usize {
+    self.encoder.encoded_window_count()
+  }
+
+  /// Whether the session is still active (not stopped / cancelled).
+  #[inline(always)]
+  pub fn is_active(&self) -> bool {
+    self.is_active
+  }
+
+  /// Borrow the unified [`SessionRetryState`] — used by in-module tests
+  /// to inspect the retry-state machine. Not part of the public surface.
+  #[cfg(test)]
+  pub(super) fn retry_state(&self) -> &SessionRetryState {
+    &self.retry_state
+  }
+
+  /// Mutable access to the unified retry state — used by in-module tests
+  /// that need to inject a retry obligation (e.g., direct staging of a
+  /// `StopEncoderFeed` mel for a regression test that doesn't go through
+  /// the normal stop()-Err path). Not part of the public surface.
+  #[cfg(test)]
+  pub(super) fn retry_state_mut(&mut self) -> &mut SessionRetryState {
+    &mut self.retry_state
+  }
+
+  /// Feed audio samples + run a decode pass when the cadence/boundary
+  /// rules dictate. Returns the events emitted during this call —
+  /// empty `Vec` when no decode runs.
+  ///
+  /// # Retry contract
+  ///
+  /// Discharges any pending retry obligation (a prior call's failed
+  /// stage) BEFORE processing the new `samples`. If discharge succeeds
+  /// fully (no obligation remains), the new audio flows through the
+  /// normal `mel.process` → `encoder.feed` → decode-pass pipeline. If
+  /// discharge errs OR a later stage errs, the obligation is re-armed
+  /// in the internal retry-state machine and the next call resumes
+  /// from exactly that point. No new audio is consumed by `mel.process`
+  /// if discharge hasn't fully completed — that contract is what kills
+  /// the "new audio jumps ahead of staged stop-tail" reordering corner.
+  ///
+  /// # Errors
+  /// Propagates from the mel processor / encoder / decoder backend.
+  pub fn feed_audio(&mut self, samples: &[f32]) -> Result<Vec<TranscriptionEvent>> {
+    if !self.is_active {
+      return Ok(Vec::new());
+    }
+
+    self.total_samples_fed = self.total_samples_fed.saturating_add(samples.len());
+
+    let mut events: Vec<TranscriptionEvent> = Vec::new();
+
+    // 1. Discharge any pending retry obligation FIRST. This is the
+    //    transactional bridge for all cross-call retry work:
+    //    a prior call's failed encoder.feed, a prior call's
+    //    successful bridge drain that lost its decode obligation to a
+    //    later `?`, or a prior call's failed finalize-decode
+    //    all resume HERE. `discharge_ran_decode` records whether the
+    //    discharge fired run_decode_pass / finalize_completed_windows
+    //    — if so, the normal feed-path below MUST NOT fire a second
+    //    decode pass on the (now-already-consumed) bridge-drained or
+    //    queue-drained windows.
+    let (discharge_events, discharge_ran_decode) = self.discharge_retry_obligation()?;
+    events.extend(discharge_events);
+
+    // 2. If discharge left obligations standing (a fresh Err in the
+    //    discharge itself, OR a partial advance — e.g. drained but
+    //    decode not yet run), return what completed and let the next
+    //    call retry. NO new audio is consumed until the obligation is
+    //    fully discharged. This contract preserves in-order delivery
+    //    AND kills the cross-call leak class structurally.
+    if self.retry_state.has_obligation() {
+      return Ok(events);
+    }
+
+    // 3. Normal feed-audio path. Each fallible step below MUST either
+    //    fully succeed or set an appropriate retry_state.resume_at
+    //    BEFORE propagating the Err.
+    //
+    //    `mel.process` is itself non-transactional but the failure
+    //    surface (mel.process Errs after consuming overlap) is rare
+    //    in practice — IncrementalMelSpectrogram::process only fails
+    //    inside MLX-internal compute ops that don't see the input
+    //    sample buffer directly. The session does NOT arm a retry
+    //    here; a mel.process Err currently propagates as a hard error.
+    //    If a real backend ever surfaces a recoverable mel.process Err
+    //    we extend RetryStage with a MelProcess variant; for now the
+    //    pipeline matches the Swift reference's "no recovery" stance.
+    let mel_opt = self.mel_processor.process(samples)?;
+    let new_windows = if let Some(mel_frames) = mel_opt.as_ref() {
+      // encoder.feed is transactional (by design): on Err
+      // self.encoder.pending_frames is preserved and the same
+      // mel_frames can be re-fed by the caller. We propagate the Err
+      // WITHOUT arming retry_state — the encoder rolled back, no
+      // windows were committed, so there's no stranded work.
+      self.encoder.feed(mel_frames)?
+    } else {
+      0
+    };
+    if new_windows > 0 || self.encoder.has_pending_frames() {
+      self.has_new_encoder_content = true;
+    }
+
+    let now = Instant::now();
+    if new_windows > 0 {
+      let boost = self.config.boundary_boost_seconds().max(0.0);
+      if boost > 0.0 {
+        self.boundary_fast_decode_until = Some(now + std::time::Duration::from_secs_f64(boost));
+      } else {
+        self.boundary_fast_decode_until = None;
+      }
+    }
+
+    let effective_decode_interval_seconds = if let Some(until) = self.boundary_fast_decode_until
+      && now < until
+    {
+      let fast = self.config.boundary_decode_interval_seconds().max(0.05);
+      let normal = self.config.decode_interval_seconds().max(0.05);
+      fast.min(normal)
+    } else {
+      self.boundary_fast_decode_until = None;
+      self.config.decode_interval_seconds().max(0.05)
+    };
+
+    let has_pending_retries =
+      self.config.finalize_completed_windows() && !self.retry_state.finalize_queue().is_empty();
+
+    let should_decode =
+      if (self.config.finalize_completed_windows() && new_windows > 0) || has_pending_retries {
+        true
+      } else if let Some(last) = self.last_decode_time {
+        now.duration_since(last).as_secs_f64() >= effective_decode_interval_seconds
+      } else {
+        self.has_new_encoder_content
+      };
+
+    // If the discharge already ran a
+    // decode pass (consuming the bridge-drained or queue-drained
+    // windows), DO NOT fire a second decode in the normal path — the
+    // encoder's pending_frames may still be non-empty (1-row carry
+    // after a 9→1+8 window split, etc.) but the contract is "discharge
+    // consumed the obligation; new audio drives its own decode only
+    // when new_windows > 0 here."
+    let skip_normal_decode = discharge_ran_decode && new_windows == 0;
+    if should_decode && (self.has_new_encoder_content || has_pending_retries) && !skip_normal_decode
+    {
+      self.has_new_encoder_content = false;
+      let is_boundary_finalize_pass = self.config.finalize_completed_windows() && new_windows > 0;
+      if !is_boundary_finalize_pass {
+        self.last_decode_time = Some(now);
+      }
+      // encoder.feed above may have committed
+      // one or more new windows to encoder.newly_encoded_windows
+      // (`new_windows > 0`). If `run_decode_pass` Errs, the windows are
+      // stranded in the encoder — the next call MUST decode them. Arm
+      // DecodeOwed BEFORE the fallible run_decode_pass so the obligation
+      // survives `?` propagation. On Ok we clear it. The DecodeOwed
+      // obligation is the cross-call source of truth — there is no
+      // per-call local count that would be lost to the `?` unwind.
+      //
+      // The arming is unconditional (even when new_windows == 0) for
+      // the case where this decode is being run for `has_pending_retries`
+      // — the queue front is the failed entry, the call MUST drive it
+      // through. clear_decode_owed is also called when the queue is
+      // empty + new_windows == 0, so this is a no-op there.
+      if new_windows > 0 || has_pending_retries {
+        self.retry_state.arm_decode_owed();
+      }
+      let decode_events = self.run_decode_pass()?;
+      events.extend(decode_events);
+      self.retry_state.clear_decode_owed();
+    }
+
+    Ok(events)
+  }
+
+  /// Flush pending samples + run the final decode pass + emit the
+  /// terminal [`TranscriptionEvent::Ended`] event.
+  ///
+  /// # Retry contract
+  ///
+  /// `stop` is **retryable on `Err`**. Every fallible stage either
+  /// commits fully or sets a resume-point in the internal retry-state
+  /// machine before propagating; the next `stop()` / `feed_audio()`
+  /// call discharges from exactly that stage. The session only flips
+  /// `is_active` to `false` AFTER ALL fallible work has succeeded — a
+  /// second stop() after a partial failure picks up where the prior
+  /// one left off.
+  ///
+  /// After `stop` returns `Ok`, [`is_active`](Self::is_active) returns
+  /// `false`, the session is terminated, and any follow-up `feed_audio`
+  /// is a no-op. A follow-up `stop` after success returns
+  /// `Ok(Vec::new())`.
+  ///
+  /// A follow-up `stop` while the session is already inactive AND the
+  /// retry-state machine has no obligation also returns
+  /// `Ok(Vec::new())`.
+  ///
+  /// # Errors
+  /// Propagates from the mel processor / encoder / decoder backend.
+  pub fn stop(&mut self) -> Result<Vec<TranscriptionEvent>> {
+    // Guard: "inactive AND nothing left to retry" exits. Fall
+    // through if the retry state still owes work — a prior stop() Err
+    // left obligations the second stop() must discharge.
+    if !self.is_active && !self.retry_state.has_obligation() {
+      return Ok(Vec::new());
+    }
+
+    let mut events: Vec<TranscriptionEvent> = Vec::new();
+
+    // 1. Fast path: if a prior stop()'s StopPartialDecode is the only
+    //    outstanding obligation, jump straight to the partial-decode
+    //    + Ended emission. The earlier stages (mel.flush, encoder.feed,
+    //    finalize) all committed cleanly in the prior call.
+    if self.retry_state.has_pending_stop_partial_decode()
+      && !self.retry_state.has_pending_stop_encoder_feed()
+      && !self.retry_state.has_decode_owed()
+      && self.retry_state.finalize_queue().is_empty()
+    {
+      let audio_features = self
+        .retry_state
+        .take_stop_partial_decode_features()
+        .expect("guard above asserted has_pending_stop_partial_decode");
+      // Re-arm so any Err in the call below re-installs the obligation
+      // for the next stop()'s retry. Cloning the array is cheap
+      // (refcount); the rare try_clone Err path is handled below.
+      //
+      // Mapping a clone failure to `None` (via `try_clone().ok()`)
+      // would be wrong: the next stop() would observe a
+      // `StopPartialDecode { audio_features: None }` obligation and
+      // behave as "no partial audio to decode" — dropping the window.
+      // Instead the clone failure propagates as `Err`, and we move the
+      // ORIGINAL audio_features back into the obligation so a third
+      // stop() can still consume it. The current call's
+      // finalize_partial_window_and_emit_ended is skipped on Err
+      // (preserving the invariant that the obligation is the only
+      // remaining handle to the partial window).
+      let reinstate = match clone_partial_decode_payload(audio_features.as_ref()) {
+        Ok(p) => p,
+        Err(e) => {
+          self.retry_state.arm_stop_partial_decode(audio_features);
+          return Err(e);
+        }
+      };
+      self.retry_state.arm_stop_partial_decode(reinstate);
+      self.finalize_partial_window_and_emit_ended(audio_features, &mut events)?;
+      // SUCCESS: clear the just-re-armed obligation.
+      let _ = self.retry_state.take_stop_partial_decode_features();
+      self.is_active = false;
+      self.encoder.reset();
+      self.mel_processor.reset();
+      self.boundary_fast_decode_until = None;
+      self.retry_state.clear_all();
+      return Ok(events);
+    }
+
+    // 2. Discharge any pending retry obligation FIRST. Drives the
+    //    StopEncoderFeed / DecodeOwed / pending-finalize-queue retry
+    //    stages transactionally.
+    let (discharge_events, _ran_decode) = self.discharge_retry_obligation()?;
+    events.extend(discharge_events);
+
+    if self.retry_state.has_obligation() {
+      // Partial discharge (a stage errored mid-way OR the discharge
+      // advanced to a new resume point that needs the next stop()).
+      // Don't go further; the next stop() will pick up where this one
+      // left off.
+      return Ok(events);
+    }
+
+    // 3. Stage: mel.flush. mel.flush is transactional (clone-then-clear
+    //    on success — see IncrementalMelSpectrogram::flush). On Err
+    //    self.overlap_buffer stays intact + retry_state.resume_at =
+    //    StopMelFlush so the next stop() retries the same flush.
+    self.retry_state.stage_stop_mel_flush();
+    let mel_opt = self.mel_processor.flush()?;
+    self.retry_state.clear_stop_mel_flush();
+
+    // 4. Stage: encoder.feed of the stop-tail mel rows. If mel.flush
+    //    yielded rows, we stage them in retry_state BEFORE feed (so an
+    //    encoder.feed Err preserves the freshly-flushed rows for a
+    //    cross-call retry — mel.flush has already committed-and-cleared
+    //    its overlap on its own commit).
+    //
+    //    encoder.feed is itself transactional, so self.encoder.* is
+    //    preserved on Err — but the LOCAL mel rows live nowhere else;
+    //    the StopEncoderFeed stage carries them.
+    if let Some(mel_frames) = mel_opt {
+      self.retry_state.stage_stop_encoder_feed(mel_frames);
+      let _drain_window_count = self
+        .retry_state
+        .discharge_stop_encoder_feed(&mut self.encoder)?;
+      // The discharge advanced resume_at to DecodeOwed iff drain > 0.
+      // For stop(), we drive the decode pass for those windows in THIS
+      // same call (finalize/freeze below handles them), so clear the
+      // DecodeOwed obligation pre-emptively.
+      self.retry_state.clear_decode_owed();
+    }
+
+    // 5. Stage: finalize-queue drain (or freeze for the no-finalize
+    //    path). On Err, the queue front is unchanged so the next
+    //    stop()/feed_audio() retry path drives the queue.
+    if self.config.finalize_completed_windows() {
+      let drained = self.encoder.drain_newly_encoded_windows();
+      for window in drained {
+        self.retry_state.enqueue_finalize(window);
+      }
+      if !self.retry_state.finalize_queue().is_empty() {
+        let finalize_events = self.finalize_completed_windows()?;
+        events.extend(finalize_events);
+      }
+    } else {
+      self.freeze_completed_windows();
+    }
+
+    // 6. Stage: partial-window decode + Ended emission. encode_pending
+    //    is itself fallible — its Err propagates with retry_state in
+    //    clean state (`stop()` returns Err, caller re-enters mainline
+    //    body; encode_pending is `&self` + idempotent, re-runs from
+    //    the same state).
+    //
+    //    Once we have audio_features, arm StopPartialDecode with a
+    //    refcount-clone so an Err in the decode below re-arms the
+    //    obligation for the next stop()'s fast path.
+    //
+    //    Mapping a clone failure to `None` (via `try_clone().ok()`)
+    //    would be wrong: the obligation would be armed as
+    //    `StopPartialDecode { audio_features: None }` and the next
+    //    stop()'s fast path would treat the partial window as absent.
+    //    Instead we propagate the clone Err BEFORE arming; the
+    //    original `audio_features` is preserved locally + the
+    //    fallible stages preceding step 6 are idempotent, so the
+    //    next stop() recomputes `encode_pending` from the unchanged
+    //    encoder state.
+    let audio_features = self.encoder.encode_pending()?;
+    let reinstate = clone_partial_decode_payload(audio_features.as_ref())?;
+    self.retry_state.arm_stop_partial_decode(reinstate);
+    self.finalize_partial_window_and_emit_ended(audio_features, &mut events)?;
+    // SUCCESS: clear the just-armed StopPartialDecode obligation.
+    let _ = self.retry_state.take_stop_partial_decode_features();
+
+    // 7. ALL fallible work succeeded — terminate the session.
+    self.is_active = false;
+    self.encoder.reset();
+    self.mel_processor.reset();
+    self.boundary_fast_decode_until = None;
+    self.retry_state.clear_all();
+
+    Ok(events)
+  }
+
+  /// Cancel without producing the final `.ended` event — used for
+  /// abandoned sessions. Clears all retry obligations atomically.
+  pub fn cancel(&mut self) {
+    self.is_active = false;
+    self.encoder.reset();
+    self.mel_processor.reset();
+    self.boundary_fast_decode_until = None;
+    self.shared = SessionSharedState::default();
+    // Unified clear: one call discharges every kind of pending
+    // obligation — finalize queue, resume_at stage, the lot.
+    self.retry_state.clear_all();
+  }
+
+  /// Reset all state for a fresh session.
+  pub fn reset(&mut self) {
+    self.is_active = true;
+    self.total_samples_fed = 0;
+    self.last_decode_time = None;
+    self.boundary_fast_decode_until = None;
+    self.has_new_encoder_content = false;
+    self.frozen_window_count = 0;
+    self.encoder.reset();
+    self.mel_processor.reset();
+    self.shared = SessionSharedState::default();
+    self.retry_state.clear_all();
+  }
+
+  // -------------------------------------------------------------------
+  // Internal: retry-state discharge
+  // -------------------------------------------------------------------
+
+  /// Top-of-call discharge for any pending retry obligation.
+  ///
+  /// Dispatches on `retry_state.resume_at` and drives the named stage's
+  /// work. Each stage's discharge either fully commits (advancing the
+  /// resume point to `None` or to a downstream stage) or fully rolls
+  /// back (leaving the resume point as it was). No partial commit
+  /// leaves the session in an inconsistent state — that's the whole
+  /// point of the unified state machine.
+  ///
+  /// Returns the events the discharge produced AND a `ran_decode` flag
+  /// indicating whether the discharge fired `run_decode_pass` or
+  /// `finalize_completed_windows`. The caller uses `ran_decode` to
+  /// avoid a redundant decode in the normal `feed_audio` path: the
+  /// discharge already consumed the bridge-drained or queue-drained
+  /// windows; firing another decode pass on the encoder's
+  /// `pending_frames` would over-decode.
+  fn discharge_retry_obligation(&mut self) -> Result<(Vec<TranscriptionEvent>, bool)> {
+    let mut events: Vec<TranscriptionEvent> = Vec::new();
+    let mut ran_decode = false;
+
+    // (a) StopMelFlush — the next stop()'s mel.flush retry. Without an
+    //     active discharge here, an Err on stop()'s in-line
+    //     `mel.flush()` (line ~499) would stage StopMelFlush, the next
+    //     call's top-of-body `has_obligation()` check would early-return
+    //     in feed_audio's no-op-for-inactive path / stop()'s
+    //     `!is_active && !has_obligation` check would FAIL to short-
+    //     circuit (because there IS an obligation), but no discharge
+    //     would run for it — DEADLOCK: session active forever, Ended
+    //     never emitted, feed_audio accepts samples without consuming.
+    //     The discharge re-runs the same fallible flush; on success it
+    //     advances resume_at to StopEncoderFeed (if mel was produced),
+    //     so the (b) branch below picks up in the same call. On Err
+    //     there are two sub-cases (see discharge_stop_mel_flush docs):
+    //       - flush() Err → re-arms StopMelFlush (overlap intact).
+    //       - flush() Ok + try_clone Err → MOVES the flushed mel into
+    //         StopEncoderFeed and propagates Err. The mel is preserved
+    //         in the obligation; the next call's discharge will run
+    //         path (b) and feed it to the encoder. NEVER lost.
+    //     The `?` propagation leaves resume_at exactly as the discharge
+    //     set it, so the next call dispatches to whichever stage owns
+    //     the preserved payload.
+    if self.retry_state.has_pending_stop_mel_flush() {
+      let _mel_opt = self
+        .retry_state
+        .discharge_stop_mel_flush(&mut self.mel_processor)?;
+      // After Ok, resume_at is either None (no mel produced) or
+      // StopEncoderFeed (mel produced + try_clone succeeded). Fall
+      // through to (b) so the in-call StopEncoderFeed discharge fires
+      // when applicable.
+    }
+
+    // (b) StopEncoderFeed — drain the staged mel into the encoder.
+    //     Honors the contract "older staged tail reaches encoder
+    //     BEFORE any new audio" — feed_audio MUST drive this discharge.
+    if self.retry_state.has_pending_stop_encoder_feed() {
+      // The discharge transactionally re-feeds the staged mel. On
+      // success it advances resume_at to DecodeOwed iff window_count
+      // > 0 (so the same-call decode pass below covers those windows
+      // even though the locals were never created); on Err it
+      // re-arms StopEncoderFeed with the SAME payload.
+      let drain_window_count = self
+        .retry_state
+        .discharge_stop_encoder_feed(&mut self.encoder)?;
+      if drain_window_count > 0 || self.encoder.has_pending_frames() {
+        self.has_new_encoder_content = true;
+      }
+    }
+
+    // (c) DecodeOwed — a prior call drained one or more bridge-drained
+    //     windows but the same-call decode never ran.
+    //     The encoder.newly_encoded_windows (or cached) hold the
+    //     windows; we MUST decode them here BEFORE any new audio is
+    //     accepted.
+    //
+    //     The discharge is the same code as the normal run_decode_pass
+    //     path — we ARE that path, just driven from the discharge
+    //     instead of the cadence gate. On Err the retry_state stays
+    //     DecodeOwed so the next call re-enters this discharge.
+    if self.retry_state.has_decode_owed() {
+      // Clear has_new_encoder_content BEFORE the decode (mirrors the
+      // mainline feed_audio's pre-decode clear) so a successful
+      // discharge-decode doesn't trigger a redundant second decode
+      // when the normal feed_audio path runs below.
+      self.has_new_encoder_content = false;
+      let decode_events = self.run_decode_pass()?;
+      self.retry_state.clear_decode_owed();
+      events.extend(decode_events);
+      ran_decode = true;
+      // Set the cadence-gate marker so a follow-up empty feed_audio
+      // doesn't fire a redundant decode via the cadence's
+      // "last_decode_time is None ⇒ fall to has_new_encoder_content"
+      // branch. The discharge-driven decode is functionally identical
+      // to a normal decode pass for cadence purposes.
+      self.last_decode_time = Some(Instant::now());
+    }
+
+    // (d) Non-empty finalize queue with no other resume_at obligation
+    //     — a prior call's finalize-decode errored. The discharge
+    //     drives finalize_completed_windows to re-attempt the failed
+    //     entry at the queue front. On Err the queue front is
+    //     unchanged + we re-arm DecodeOwed so future calls keep
+    //     retrying. On Ok the queue drains.
+    //
+    //     This covers the contract that feed_audio(&[]) drains a
+    //     pending finalize-retry queue without consuming any new
+    //     audio. It also lets a follow-up stop() drain the queue when
+    //     a prior feed_audio errored mid-finalize.
+    if !self.retry_state.finalize_queue().is_empty() && self.retry_state.resume_at().is_none() {
+      // Same gate as the normal feed_audio decode-pass: only drive the
+      // queue when finalize_completed_windows is on (the queue is only
+      // populated in that mode).
+      if self.config.finalize_completed_windows() {
+        let finalize_events = self.finalize_completed_windows()?;
+        events.extend(finalize_events);
+        ran_decode = true;
+        self.last_decode_time = Some(Instant::now());
+      }
+    }
+
+    // (e) StopPartialDecode — feed_audio MUST NOT consume the staged
+    //     audio_features (that's stop()'s job). stop()'s mainline
+    //     re-entry handles the retry: when stop() sees
+    //     has_pending_stop_partial_decode() in its top-of-body check,
+    //     it takes the staged features and calls
+    //     finalize_partial_window_and_emit_ended directly, skipping
+    //     the mel.flush / encoder.feed / finalize stages it already
+    //     completed in the prior call. The split-discharge contract
+    //     keeps this stage's payload alive across an interleaved
+    //     feed_audio (which is a no-op for StopPartialDecode).
+    //
+    //     Implementation: stop()'s body checks
+    //     has_pending_stop_partial_decode() AFTER the main discharge,
+    //     extracts the audio_features, and dispatches to
+    //     finalize_partial_window_and_emit_ended.
+
+    Ok((events, ran_decode))
+  }
+
+  // -------------------------------------------------------------------
+  // Internal: stop()'s partial-window decode + Ended emission
+  // -------------------------------------------------------------------
+
+  /// stop()'s tail: decode the pending partial window + emit Ended.
+  ///
+  /// Extracted into a helper so the discharge of a `StopPartialDecode`
+  /// obligation can call the same logic (with the staged
+  /// `audio_features` instead of recomputing `encode_pending`).
+  fn finalize_partial_window_and_emit_ended(
+    &mut self,
+    audio_features: Option<Array>,
+    events: &mut Vec<TranscriptionEvent>,
+  ) -> Result<()> {
+    if let Some(audio_features) = audio_features {
+      if audio_features.shape().first().copied().unwrap_or(0) > 0 {
+        let display_prefix = concat_text(&self.shared.completed_text, &self.shared.confirmed_text);
+        let confirmed_count = self.shared.confirmed_token_ids.len();
+        let estimated_tokens = self
+          .config
+          .max_tokens_per_pass()
+          .min(confirmed_count.saturating_add(24).max(24));
+        let token_ids = self.decoder.decode_all_tokens(
+          &audio_features,
+          &self.shared.confirmed_token_ids,
+          &self.config,
+          estimated_tokens,
+        )?;
+        // Final text rolls everything into confirmed. Only mutate
+        // shared state AFTER the fallible decode returns Ok.
+        self.shared.confirmed_token_ids = token_ids;
+        self.shared.provisional_token_ids.clear();
+        self.shared.provisional_first_seen.clear();
+        self.shared.provisional_agreement_counts.clear();
+        self.shared.confirmed_text = self.tokenizer.decode_ids(&self.shared.confirmed_token_ids);
+        let _ = display_prefix; // computed for parity; not needed after final replace
+      }
+    } else {
+      // No pending frames — promote provisional to confirmed.
+      if !self.shared.provisional_token_ids.is_empty() {
+        let promoted = std::mem::take(&mut self.shared.provisional_token_ids);
+        self.shared.confirmed_token_ids.extend(promoted);
+        self.shared.provisional_first_seen.clear();
+        self.shared.provisional_agreement_counts.clear();
+      }
+      if !self.shared.confirmed_token_ids.is_empty() {
+        self.shared.confirmed_text = self.tokenizer.decode_ids(&self.shared.confirmed_token_ids);
+      }
+    }
+
+    let final_text = concat_text(&self.shared.completed_text, &self.shared.confirmed_text);
+    events.push(TranscriptionEvent::ended(final_text));
+
+    Ok(())
+  }
+
+  // -------------------------------------------------------------------
+  // Internal: decode-pass orchestration
+  // -------------------------------------------------------------------
+
+  fn run_decode_pass(&mut self) -> Result<Vec<TranscriptionEvent>> {
+    // If finalize_completed_windows is on AND we have newly-encoded
+    // full windows, push them onto the finalize queue + drain.
+    //
+    // Never drain newly-encoded windows out of the system in a path
+    // that can't replay them. Push freshly-drained windows into the
+    // retry queue; `finalize_completed_windows` then pops them one at a
+    // time as decodes succeed (and leaves any failed window at the
+    // front for the next pass to retry).
+    if self.config.finalize_completed_windows() {
+      let drained = self.encoder.drain_newly_encoded_windows();
+      for window in drained {
+        self.retry_state.enqueue_finalize(window);
+      }
+      if !self.retry_state.finalize_queue().is_empty() {
+        return self.finalize_completed_windows();
+      }
+    } else {
+      self.freeze_completed_windows();
+    }
+
+    // Only decode the current pending (partial) window.
+    let Some(audio_features) = self.encoder.encode_pending()? else {
+      return Ok(Vec::new());
+    };
+    let num_audio_tokens = audio_features.shape().first().copied().unwrap_or(0);
+    if num_audio_tokens == 0 {
+      return Ok(Vec::new());
+    }
+
+    let confirmed_count = self.shared.confirmed_token_ids.len();
+    let windowed_seconds = num_audio_tokens as f64 / 13.0;
+    let estimated_total_tokens = ((windowed_seconds * 10.0).ceil() as usize).max(24);
+    let max_tokens = self
+      .config
+      .max_tokens_per_pass()
+      .min(estimated_total_tokens.max(confirmed_count.saturating_add(24)));
+
+    let display_prefix = concat_text(&self.shared.completed_text, &self.shared.confirmed_text);
+    let min_agreement_passes = if let Some(until) = self.boundary_fast_decode_until
+      && Instant::now() < until
+    {
+      self
+        .config
+        .min_agreement_passes()
+        .max(self.config.boundary_min_agreement_passes())
+        .max(1)
+    } else {
+      self.config.min_agreement_passes().max(1)
+    };
+
+    let params = DecodePassParams {
+      audio_features: &audio_features,
+      confirmed_token_ids: self.shared.confirmed_token_ids.clone(),
+      display_prefix,
+      prev_provisional: self.shared.provisional_token_ids.clone(),
+      prev_first_seen: self.shared.provisional_first_seen.clone(),
+      prev_agreement_counts: self.shared.provisional_agreement_counts.clone(),
+      min_agreement_passes,
+    };
+
+    let start = Instant::now();
+    let all_token_ids = self.decoder.decode_all_tokens(
+      params.audio_features,
+      &params.confirmed_token_ids,
+      &self.config,
+      max_tokens,
+    )?;
+    let decode_time = start.elapsed().as_secs_f64();
+
+    Ok(self.promote_tokens(&all_token_ids, &params, decode_time))
+  }
+
+  fn promote_tokens(
+    &mut self,
+    all_token_ids: &[u32],
+    params: &DecodePassParams<'_>,
+    decode_time: f64,
+  ) -> Vec<TranscriptionEvent> {
+    let confirmed_count = params.confirmed_token_ids.len();
+    let new_provisional: Vec<u32> = all_token_ids
+      .iter()
+      .skip(confirmed_count)
+      .copied()
+      .collect();
+    let gen_token_count = all_token_ids.len();
+    let now = Instant::now();
+    let delay = std::time::Duration::from_millis(u64::from(self.config.delay_preset().delay_ms()));
+
+    // Common prefix match-length between prev provisional and new.
+    let mut match_len = 0;
+    let compare_len = params.prev_provisional.len().min(new_provisional.len());
+    for (i, new_id) in new_provisional.iter().enumerate().take(compare_len) {
+      if params.prev_provisional[i] == *new_id {
+        match_len = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    let mut next_first_seen: Vec<Instant> = Vec::with_capacity(new_provisional.len());
+    let mut next_agreement_counts: Vec<usize> = Vec::with_capacity(new_provisional.len());
+    for i in 0..new_provisional.len() {
+      if i < match_len {
+        let seen = params.prev_first_seen.get(i).copied().unwrap_or(now);
+        let prev_agreement = params.prev_agreement_counts.get(i).copied().unwrap_or(1);
+        next_first_seen.push(seen);
+        next_agreement_counts.push(prev_agreement.saturating_add(1).max(1));
+      } else {
+        next_first_seen.push(now);
+        next_agreement_counts.push(1);
+      }
+    }
+
+    let required_agreement_passes = params.min_agreement_passes.max(1);
+    let mut promotion_count = 0;
+    for i in 0..new_provisional.len() {
+      let has_delay = next_first_seen
+        .get(i)
+        .map(|t| now.duration_since(*t) >= delay)
+        .unwrap_or(false);
+      let has_agreement = next_agreement_counts
+        .get(i)
+        .map(|c| *c >= required_agreement_passes)
+        .unwrap_or(false);
+      if has_delay && has_agreement {
+        promotion_count = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    let final_provisional: Vec<u32> = new_provisional
+      .iter()
+      .skip(promotion_count)
+      .copied()
+      .collect();
+    let final_first_seen: Vec<Instant> = next_first_seen
+      .iter()
+      .skip(promotion_count)
+      .copied()
+      .collect();
+    let final_agreement_counts: Vec<usize> = next_agreement_counts
+      .iter()
+      .skip(promotion_count)
+      .copied()
+      .collect();
+
+    let mut events: Vec<TranscriptionEvent> = Vec::new();
+    if promotion_count > 0 {
+      let promoted: Vec<u32> = new_provisional[..promotion_count].to_vec();
+      self.shared.confirmed_token_ids.extend(promoted);
+      self.shared.confirmed_text = self.tokenizer.decode_ids(&self.shared.confirmed_token_ids);
+      events.push(TranscriptionEvent::confirmed(concat_text(
+        &self.shared.completed_text,
+        &self.shared.confirmed_text,
+      )));
+    }
+    self.shared.provisional_token_ids = final_provisional.clone();
+    self.shared.provisional_first_seen = final_first_seen;
+    self.shared.provisional_agreement_counts = final_agreement_counts;
+
+    let final_prov_text = self.tokenizer.decode_ids(&final_provisional);
+    let display_prefix = concat_text(&self.shared.completed_text, &self.shared.confirmed_text);
+    events.push(TranscriptionEvent::display_update(
+      display_prefix,
+      final_prov_text,
+    ));
+    let _ = params.display_prefix; // shape parity — used only for the streaming preview event
+
+    let total_audio_seconds = self.total_samples_fed as f64 / 16_000.0;
+    let tps = if decode_time > 0.0 {
+      gen_token_count as f64 / decode_time
+    } else {
+      0.0
+    };
+    events.push(TranscriptionEvent::Stats(StreamingStats {
+      encoded_window_count: self.encoder.encoded_window_count(),
+      total_audio_seconds,
+      tokens_per_second: tps,
+      real_time_factor: 0.0,
+      peak_memory_gb: peak_memory_gb_or_zero(),
+    }));
+    events
+  }
+
+  /// Finalize the windows in `retry_state.finalize_queue`: run a fresh
+  /// decode over each, append its text to `completed_text`, and reset
+  /// the streaming decode state.
+  ///
+  /// ALWAYS run `decoder.decode_all_tokens` for finalized windows.
+  /// The previously-streamed provisional/confirmed text is consulted
+  /// only as an explicit fallback when the full decode for the first
+  /// queued window returns empty text — otherwise the streamed
+  /// preview's partial-text would freeze in place and the rest of the
+  /// boundary audio would be dropped.
+  ///
+  /// Pops one window at a time, advancing `frozen_window_count`
+  /// after each successful append. On `Err` the failed window is left
+  /// at the queue front so a subsequent `feed_audio` / `stop` call can
+  /// retry it without losing already-encoded audio.
+  ///
+  /// Fallback gating: the per-entry `fallback_consumed` flag
+  /// in [`PendingFinalize`] is set BEFORE the fallible decode call so
+  /// a decode Err does NOT re-arm the fallback. The streamed-text
+  /// fallback is offered AT MOST ONCE per queued window across all
+  /// retry attempts.
+  fn finalize_completed_windows(&mut self) -> Result<Vec<TranscriptionEvent>> {
+    if self.retry_state.finalize_queue().is_empty() {
+      return Ok(Vec::new());
+    }
+    let mut total_decode_time: f64 = 0.0;
+    let mut total_generated_tokens: usize = 0;
+
+    let mut events: Vec<TranscriptionEvent> = Vec::new();
+    while let Some(pending) = self.retry_state.finalize_queue_mut().front_mut() {
+      // Fallback gating: capture the streamed-text fallback
+      // ONLY if THIS queue entry hasn't been offered it yet. The flag
+      // flips to `true` BEFORE the fallible decode below so that on a
+      // decode `Err`, the next retry sees `fallback_consumed == true`
+      // and gets `None` — stale streamed text from `shared.*` is
+      // never re-applied.
+      let candidate_fallback = if !pending.fallback_consumed {
+        pending.fallback_consumed = true;
+        let mut stream_tokens: Vec<u32> = self.shared.confirmed_token_ids.clone();
+        stream_tokens.extend(self.shared.provisional_token_ids.iter().copied());
+        if stream_tokens.is_empty() {
+          None
+        } else {
+          Some(self.tokenizer.decode_ids(&stream_tokens))
+        }
+      } else {
+        None
+      };
+      let num_audio_tokens = pending.encoder_output.shape().first().copied().unwrap_or(0);
+      let selected_window_text = if num_audio_tokens == 0 {
+        // Empty audio: skip decode but allow the streamed fallback to
+        // carry text forward (rare — guards against zero-row boundary
+        // windows the encoder occasionally produces). On retry for
+        // this same entry, `candidate_fallback` is `None` (flag is
+        // sticky), so a retry yields an empty selected text rather
+        // than the stale fallback.
+        candidate_fallback.unwrap_or_default()
+      } else {
+        let start = Instant::now();
+        // ALWAYS attempt the full decode. On `Err` the `?`
+        // propagates up; the queue front is unchanged so the next
+        // pass retries this window. `frozen_window_count` has NOT
+        // advanced yet, preserving the invariant
+        // `frozen_window_count == encoded_window_count - queue.len()`.
+        let token_ids = self.decoder.decode_all_tokens(
+          &pending.encoder_output,
+          &[],
+          &self.config,
+          self.config.max_tokens_per_pass(),
+        )?;
+        let decode_time = start.elapsed().as_secs_f64();
+        total_decode_time += decode_time;
+        total_generated_tokens = total_generated_tokens.saturating_add(token_ids.len());
+        let full_text = self.tokenizer.decode_ids(&token_ids);
+        // Only fall back to streamed text when the FULL decode
+        // produced nothing. Otherwise the full decode wins.
+        if full_text.trim().is_empty()
+          && let Some(fallback) = candidate_fallback
+        {
+          fallback
+        } else {
+          full_text
+        }
+      };
+      // Decode succeeded (or there was no audio to decode): commit
+      // this window now, clear shared streaming state, advance the
+      // frozen-window counter, and pop the queue.
+      if !selected_window_text.trim().is_empty() {
+        append_text(&selected_window_text, &mut self.shared.completed_text);
+      }
+      self.shared.confirmed_token_ids.clear();
+      self.shared.provisional_token_ids.clear();
+      self.shared.provisional_first_seen.clear();
+      self.shared.provisional_agreement_counts.clear();
+      self.shared.confirmed_text.clear();
+      self.retry_state.finalize_queue_mut().pop_front();
+      self.frozen_window_count = self.frozen_window_count.saturating_add(1);
+    }
+
+    let total_audio_seconds = self.total_samples_fed as f64 / 16_000.0;
+    let tps = if total_decode_time > 0.0 {
+      total_generated_tokens as f64 / total_decode_time
+    } else {
+      0.0
+    };
+    events.push(TranscriptionEvent::Stats(StreamingStats {
+      encoded_window_count: self.encoder.encoded_window_count(),
+      total_audio_seconds,
+      tokens_per_second: tps,
+      real_time_factor: 0.0,
+      peak_memory_gb: peak_memory_gb_or_zero(),
+    }));
+    Ok(events)
+  }
+
+  fn freeze_completed_windows(&mut self) {
+    let current = self.encoder.encoded_window_count();
+    if current <= self.frozen_window_count {
+      return;
+    }
+    let mut all_tokens: Vec<u32> = self.shared.confirmed_token_ids.clone();
+    all_tokens.extend(self.shared.provisional_token_ids.iter().copied());
+    if !all_tokens.is_empty() {
+      let window_text = self.tokenizer.decode_ids(&all_tokens);
+      append_text(&window_text, &mut self.shared.completed_text);
+    }
+    self.shared.confirmed_token_ids.clear();
+    self.shared.provisional_token_ids.clear();
+    self.shared.provisional_first_seen.clear();
+    self.shared.provisional_agreement_counts.clear();
+    self.shared.confirmed_text.clear();
+    self.frozen_window_count = current;
+  }
+}
+
+// ---------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------
+
+/// Append `segment` to `base` with whitespace handling — mirrors
+/// Swift's `appendText`'s `trimmingCharacters(in: .whitespacesAndNewlines)`
+/// plus the leading-space insertion when both halves are non-empty and
+/// neither side already supplies the boundary whitespace. Simplified
+/// (no deduping) — the Swift reference's dedupe heuristics are
+/// decode-quality polish, not orchestration semantics. Reuse via
+/// [`concat_text`].
+fn append_text(segment: &str, base: &mut String) {
+  let trimmed = segment.trim();
+  if trimmed.is_empty() {
+    return;
+  }
+  if base.is_empty() {
+    base.push_str(trimmed);
+    return;
+  }
+  let base_last_is_ws = base.chars().last().is_some_and(char::is_whitespace);
+  let seg_first_is_ws = trimmed.chars().next().is_some_and(char::is_whitespace);
+  if base_last_is_ws || seg_first_is_ws {
+    base.push_str(trimmed);
+  } else {
+    base.push(' ');
+    base.push_str(trimmed);
+  }
+}
+
+fn concat_text(a: &str, b: &str) -> String {
+  let mut out = String::with_capacity(a.len() + b.len() + 1);
+  out.push_str(a);
+  append_text(b, &mut out);
+  out
+}
+
+/// Refcount-clone the partial-decode audio_features for re-arming the
+/// `StopPartialDecode` obligation. Returns `Ok(None)` when there is no
+/// payload to clone (the prior `encode_pending` returned `None`), and
+/// `Ok(Some(cloned))` on a successful refcount clone.
+///
+/// Propagates [`Array::try_clone`] errors with a contextual message
+/// instead of silently dropping the failure into `None` (which would
+/// have made the next retry behave as "no partial audio" and drop the
+/// real payload — see the `stop()` call-site comments).
+fn clone_partial_decode_payload(features: Option<&Array>) -> Result<Option<Array>> {
+  match features {
+    None => Ok(None),
+    Some(a) => a.try_clone().map(Some).map_err(|e| {
+      crate::Error::LayerKeyed(LayerKeyedPayload::new(
+        "StopPartialDecode: failed to clone audio_features for retry",
+        e,
+      ))
+    }),
+  }
+}
+
+/// Wrapper around [`crate::memory::peak_memory`] that returns
+/// `peak / 1e9` GB or `0.0` if the read errors. Mirrors the Swift
+/// reference's `Double(Memory.peakMemory) / 1e9` formula.
+fn peak_memory_gb_or_zero() -> f64 {
+  crate::memory::peak_memory()
+    .map(|bytes| bytes as f64 / 1e9)
+    .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests;

@@ -20,7 +20,10 @@ let step = 0;
 let cfg;
 let perms = { microphone: "not_determined", accessibility: false };
 let models = [];
-let ollama = { reachable: false, models: [] };
+let cleanupModels = [];
+let cleanupDl = null; // {id, done, total} while downloading a clean-up model
+let cleanupDlError = null;
+let cleanupPrev = null; // model selected before an add, restored if the add fails
 let dl = null; // {id, done, total} while downloading
 let dlError = null;
 let accessSkipped = false;
@@ -34,6 +37,7 @@ function canContinue() {
     case "mic": return perms.microphone === "authorized";
     case "access": return perms.accessibility || accessSkipped;
     case "model": return !dl && models.find((m) => m.id === selectedModel())?.installed;
+    case "cleanup": return !cfg.cleanup_enabled || (!cleanupDl && cleanupModels.find((m) => m.id === cfg.cleanup_model)?.installed);
     default: return true;
   }
 }
@@ -132,24 +136,57 @@ const views = {
   },
 
   cleanup() {
-    const reach = ollama.reachable;
+    const on = cfg.cleanup_enabled;
+    const sel = cfg.cleanup_model;
+    const cur = cleanupModels.find((m) => m.id === sel);
+    const busy = !!cleanupDl;
     page.innerHTML = `
-      <h1>Text clean-up <span class="muted" style="font-weight:400">(optional)</span></h1>
-      <p class="muted">A small local language model can remove "um"s and fix punctuation before typing. It runs through <b>Ollama</b>, also on this Mac. Without it, Zipscribe still types a lightly tidied transcript.</p>
-      <div class="card">
-        <div class="row"><div class="label">Ollama<small>${reach ? "Running on this Mac" : "Not detected"}</small></div>
-          <span class="chip ${reach ? "ok" : "warn"}">${reach ? "Found" : "Not found"}</span></div>
-        ${reach ? `
-        <div class="row"><div class="label">Use AI clean-up</div>
-          <label class="switch"><input type="checkbox" id="cu" ${cfg.cleanup_enabled ? "checked" : ""}><span></span></label></div>
-        <div class="row ${cfg.cleanup_enabled ? "" : "hidden"}" id="cmrow"><div class="label">Model<small>Larger models clean up better but are slower</small></div>
-          <select id="cm" class="w-sm">${modelOptions()}</select></div>`
-        : `<div class="col"><p class="muted" style="margin:0">To enable it, install Ollama from <b>ollama.com</b>, then run <code>ollama pull qwen2.5:7b</code> in Terminal.</p></div>`}
-      </div>
-      <p style="margin-top:14px"><button id="recheck">Check again</button></p>`;
-    $("#cu")?.addEventListener("change", (e) => { cfg.cleanup_enabled = e.target.checked; $("#cmrow").classList.toggle("hidden", !e.target.checked); });
-    $("#cm")?.addEventListener("change", (e) => { cfg.cleanup_model = e.target.value; });
-    $("#recheck").addEventListener("click", async () => { await checkOllama(); render(); });
+      <h1>Text clean-up</h1>
+      <p class="muted">An optional small language model, running entirely on this Mac, removes "um"s and
+      fixes punctuation before your words are typed. Nothing is sent over the internet.</p>
+      <div class="card"><div class="row">
+        <div class="label">Use AI clean-up<small>${on ? "Pick a model below." : "Off — Zipscribe will type a lightly tidied transcript instead."}</small></div>
+        <label class="switch"><input type="checkbox" id="cu" ${on ? "checked" : ""}><span></span></label>
+      </div></div>
+      <div class="${on ? "" : "hidden"}">
+        <h2>Model</h2>
+        <p class="muted">Smaller is faster; bigger cleans up better. It's a one-time download.</p>
+        <div class="card">
+          ${cleanupModels.map((m) => `
+            <label class="opt">
+              <input type="radio" name="cm" value="${esc(m.id)}" ${m.id === sel ? "checked" : ""} ${busy ? "disabled" : ""}>
+              <div class="grow"><b>${esc(m.label)}</b>
+                ${m.is_default ? `<span class="chip">Recommended</span>` : ""}
+                ${m.installed ? `<span class="chip ok">Installed</span>` : ""}
+                <small>${fmtMB(m.size_mb)}${m.custom ? " · added from HuggingFace" : ""}</small></div>
+            </label>`).join("")}
+        </div>
+        <div style="margin-top:14px">
+          ${busy ? cleanupDlHtml()
+            : cur && !cur.installed ? `<button class="primary" id="cinstall">Download ${fmtMB(cur.size_mb)}</button>` : ""}
+          ${cleanupDlError ? `<p class="err">${esc(cleanupDlError)}</p>` : ""}
+        </div>
+        <h2>Use your own model</h2>
+        <p class="muted">Paste a HuggingFace link or repo id for a Qwen3-based MLX model.</p>
+        <div class="inline-add">
+          <input type="text" id="hf" placeholder="mlx-community/Qwen3-8B-4bit" ${busy ? "disabled" : ""}>
+          <button id="hfadd" ${busy ? "disabled" : ""}>Add</button>
+        </div>
+      </div>`;
+    $("#cu").addEventListener("change", (e) => {
+      cfg.cleanup_enabled = e.target.checked;
+      render();
+    });
+    page.querySelectorAll("input[name=cm]").forEach((r) =>
+      r.addEventListener("change", () => { cfg.cleanup_model = r.value; cleanupDlError = null; render(); }));
+    $("#cinstall")?.addEventListener("click", () => installCleanup(sel));
+    const add = () => {
+      const v = $("#hf").value.trim();
+      if (v) installCleanup(v);
+    };
+    $("#hfadd").addEventListener("click", add);
+    $("#hf").addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+    if (busy) $("#ccancel")?.addEventListener("click", () => invoke("cancel_download"));
   },
 
   hotkey() {
@@ -172,18 +209,32 @@ const views = {
   },
 };
 
-function modelOptions() {
-  const names = ollama.models.slice();
-  if (!names.includes(cfg.cleanup_model)) names.unshift(cfg.cleanup_model);
-  return names.map((n) => `<option ${n === cfg.cleanup_model ? "selected" : ""}>${n}</option>`).join("");
+// The clean-up models: the presets plus any the user added from HuggingFace. No external service.
+async function refreshCleanupModels() {
+  cleanupModels = await invoke("cleanup_model_list");
+  if (!cleanupModels.some((m) => m.id === cfg.cleanup_model)) {
+    cfg.cleanup_model = (cleanupModels.find((m) => m.is_default) || cleanupModels[0]).id;
+  }
 }
 
-async function checkOllama() {
-  try { ollama = { reachable: true, models: await invoke("ollama_models", { url: cfg.ollama_url }) }; }
-  catch { ollama = { reachable: false, models: [] }; }
-  if (!ollama.reachable) cfg.cleanup_enabled = false;
-  else if (!ollama.models.length) cfg.cleanup_enabled = false;
-  else if (!ollama.models.includes(cfg.cleanup_model)) cfg.cleanup_model = ollama.models.find((n) => /qwen2\.5/.test(n)) || ollama.models[0];
+// Start a preset download or a HuggingFace add. Input errors come back immediately; the rest
+// (unsupported model, network) arrive on the cleanup-done event.
+async function installCleanup(input) {
+  cleanupDlError = null;
+  try {
+    const id = await invoke("cleanup_install", { repo: input });
+    cleanupPrev = cfg.cleanup_model;
+    cfg.cleanup_model = id;
+    cleanupDl = { id, done: 0, total: 0 };
+  } catch (e) { cleanupDlError = String(e); }
+  render();
+}
+
+function cleanupDlHtml() {
+  const pct = cleanupDl.total ? (100 * cleanupDl.done / cleanupDl.total).toFixed(1) : 0;
+  return `<div class="bar"><div id="cfill" style="width:${pct}%"></div></div>
+    <div class="muted" id="ctxt">Downloading clean-up model… ${fmtBytes(cleanupDl.done)} of ${fmtBytes(cleanupDl.total)}</div>
+    <p style="margin-top:8px"><button id="ccancel">Cancel</button></p>`;
 }
 
 async function persist() { await invoke("save_config", { cfg }); }
@@ -209,7 +260,6 @@ $("#next").addEventListener("click", async () => {
     return invoke("close_window");
   }
   step++;
-  if (STEPS[step] === "cleanup") await checkOllama();
   render();
 });
 
@@ -227,11 +277,30 @@ listen("download-done", async (e) => {
   models = await invoke("model_list");
   if (STEPS[step] === "model") render();
 });
+// Clean-up model download (presets / arbitrary HF repos): its own panel, shared cancel flag.
+listen("cleanup-progress", (e) => {
+  cleanupDl = e.payload;
+  const fill = $("#cfill");
+  if (fill && cleanupDl.total) {
+    fill.style.width = (100 * cleanupDl.done / cleanupDl.total).toFixed(1) + "%";
+    $("#ctxt").textContent = `Downloading clean-up model… ${fmtBytes(cleanupDl.done)} of ${fmtBytes(cleanupDl.total)}`;
+  }
+});
+listen("cleanup-done", async (e) => {
+  cleanupDl = null;
+  cleanupDlError = e.payload.error && e.payload.error !== "cancelled" ? e.payload.error : null;
+  if (e.payload.error && cleanupPrev) cfg.cleanup_model = cleanupPrev;
+  cleanupPrev = null;
+  await refreshCleanupModels();
+  if (STEPS[step] === "cleanup") render();
+  else $("#next").disabled = !canContinue();
+});
 
 (async () => {
   cfg = await invoke("get_config");
   perms = await invoke("permissions");
   models = await invoke("model_list");
+  await refreshCleanupModels();
   render();
   pollTimer = setInterval(refresh, 1000);
 })();

@@ -113,10 +113,120 @@ pub fn decide(phase: Phase, event: crate::hotkey::P2TEvent, enabled: bool) -> (D
     }
 }
 
+enum CleanupJob {
+    Load(Option<PathBuf>),
+    Clean {
+        prompt: String,
+        raw: String,
+        timeout_secs: u64,
+        reply: std::sync::mpsc::Sender<crate::cleanup::CleanResult>,
+    },
+}
+
+/// Owns the MLX clean-up model on its own thread. MLX arrays are not `Send`, and a single MLX
+/// evaluation cannot be interrupted, so the dictation worker never runs the model itself: it
+/// hands each transcript over and waits at most the clean-up timeout. A slow, loading or busy
+/// model means the `light_cleanse` fallback is typed instead — dictation never hangs.
+pub struct CleanupWorker {
+    tx: std::sync::mpsc::Sender<CleanupJob>,
+    /// Set while the worker is loading or generating.
+    busy: Arc<AtomicBool>,
+    /// A model is loaded and usable.
+    ready: Arc<AtomicBool>,
+}
+
+impl CleanupWorker {
+    pub fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<CleanupJob>();
+        let busy = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (b, r) = (busy.clone(), ready.clone());
+        std::thread::Builder::new()
+            .name("cleanup".into())
+            .spawn(move || {
+                let mut model: Option<crate::mlx::MlxModel> = None;
+                for job in rx {
+                    match job {
+                        CleanupJob::Load(dir) => {
+                            model = None;
+                            if let Some(dir) = dir {
+                                match crate::mlx::load_model(&dir) {
+                                    Ok(m) => {
+                                        log::info!("[service] loaded MLX cleanup model: {}", dir.display());
+                                        model = Some(m);
+                                    }
+                                    Err(e) => log::warn!(
+                                        "[service] MLX cleanup load failed ({e}); using light_cleanse"
+                                    ),
+                                }
+                            }
+                            r.store(model.is_some(), Ordering::SeqCst);
+                        }
+                        CleanupJob::Clean { prompt, raw, timeout_secs, reply } => {
+                            let cleaner = crate::cleanup::Cleaner::new().with_timeout(timeout_secs);
+                            let res = match &model {
+                                Some(m) => cleaner.clean_mlx(m, &prompt, &raw),
+                                None => cleaner.fallback_clean(&raw),
+                            };
+                            let _ = reply.send(res);
+                        }
+                    }
+                    b.store(false, Ordering::SeqCst);
+                }
+            })
+            .expect("spawn cleanup thread");
+        Self { tx, busy, ready }
+    }
+
+    /// (Re)load the model in the background; `None` unloads it.
+    pub fn load(&self, dir: Option<PathBuf>) {
+        self.ready.store(false, Ordering::SeqCst);
+        self.busy.store(true, Ordering::SeqCst);
+        let _ = self.tx.send(CleanupJob::Load(dir));
+    }
+
+    /// Block until a pending load has finished (diagnostic CLI only; the live worker never waits).
+    pub fn wait_idle(&self) {
+        while self.busy.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Clean `raw`, falling back to `light_cleanse` if the model is unavailable, busy, or does not
+    /// answer within the cleaner's timeout.
+    pub fn clean(&self, cleaner: &crate::cleanup::Cleaner, prompt: &str, raw: &str) -> crate::cleanup::CleanResult {
+        if !self.ready.load(Ordering::SeqCst) || self.busy.swap(true, Ordering::SeqCst) {
+            return cleaner.fallback_clean(raw);
+        }
+        let (reply, rx) = std::sync::mpsc::channel();
+        let job = CleanupJob::Clean {
+            prompt: prompt.to_string(),
+            raw: raw.to_string(),
+            timeout_secs: cleaner.timeout_secs,
+            reply,
+        };
+        if self.tx.send(job).is_err() {
+            self.busy.store(false, Ordering::SeqCst);
+            return cleaner.fallback_clean(raw);
+        }
+        match rx.recv_timeout(std::time::Duration::from_secs(cleaner.timeout_secs.max(1))) {
+            Ok(r) => r,
+            Err(_) => {
+                log::warn!(
+                    "[service] MLX clean-up exceeded {}s; using light_cleanse fallback",
+                    cleaner.timeout_secs
+                );
+                cleaner.fallback_clean(raw)
+            }
+        }
+    }
+}
+
 /// Run the full dictation pipeline for one buffered clip: transcribe -> clean -> deliver.
 fn run_clip(
     transcriber: &mut crate::stt::Transcriber,
     cleaner: &crate::cleanup::Cleaner,
+    mlx: &CleanupWorker,
     cfg: &Config,
     pcm_i16: &[i16],
 ) {
@@ -139,16 +249,9 @@ fn run_clip(
     }
 
     let cleaned = if cfg.cleanup_enabled {
-        match cleaner.clean(&transcript.text) {
-            Ok(r) => {
-                log::info!("[service] CLEAN source={:?} -> {:?}", r.source, r.text);
-                r.text
-            }
-            Err(e) => {
-                log::warn!("[service] cleanup failed, using raw: {e:?}");
-                transcript.text.clone()
-            }
-        }
+        let r = mlx.clean(cleaner, &cfg.cleanup_system_prompt, &transcript.text);
+        log::info!("[service] CLEAN source={:?} -> {:?}", r.source, r.text);
+        r.text
     } else {
         transcript.text.clone()
     };
@@ -191,8 +294,12 @@ pub fn dictation_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, status: Status
 
     let mut seen_version = 0u64;
     let mut cfg = shared.config();
-    let mut cleaner = crate::cleanup::Cleaner::new(cfg.ollama_url.clone(), cfg.cleanup_model.clone());
+    let mut cleaner =
+        crate::cleanup::Cleaner::new()
+            .with_timeout(cfg.cleanup_timeout_secs);
     let mut model: Option<(PathBuf, crate::stt::Transcriber)> = None;
+    let mlx = CleanupWorker::spawn();
+    let mut mlx_dir: Option<PathBuf> = None;
 
     let mut phase = Phase::Idle;
     let mut handle: Option<crate::capture::CaptureHandle> = None;
@@ -209,11 +316,26 @@ pub fn dictation_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, status: Status
         if version != seen_version {
             seen_version = version;
             cfg = shared.config();
-            cleaner = crate::cleanup::Cleaner::new(cfg.ollama_url.clone(), cfg.cleanup_model.clone());
+            cleaner =
+                crate::cleanup::Cleaner::new()
+                    .with_timeout(cfg.cleanup_timeout_secs);
             let want = crate::models::resolve_path(&cfg);
             if model.as_ref().map(|(p, _)| p != &want).unwrap_or(true) {
                 status(TrayStatus::Processing);
                 model = load_model(&shared, &cfg);
+            }
+            // Resolve + (re)load the MLX cleanup model when its dir changes or cleanup is disabled.
+            let want_mlx = if cfg.cleanup_enabled {
+                crate::cleanup_models::resolve_model_dir(
+                    &cfg.cleanup_model,
+                    &cfg.cleanup_model_path,
+                )
+            } else {
+                None
+            };
+            if want_mlx != mlx_dir {
+                mlx_dir = want_mlx.clone();
+                mlx.load(want_mlx);
             }
             status(idle_status(shared.enabled.load(Ordering::Relaxed)));
         }
@@ -255,7 +377,7 @@ pub fn dictation_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, status: Status
                             if audio.rms_db() < -60.0 {
                                 log::info!("[service] clip too quiet; discarding");
                             } else {
-                                run_clip(transcriber, &cleaner, &cfg, &audio.samples);
+                                run_clip(transcriber, &cleaner, &mlx, &cfg, &audio.samples);
                             }
                         }
                         Err(e) => log::warn!("[service] capture stop/timeout: {e}"),

@@ -198,27 +198,9 @@ fn open_system_settings(pane: String) {
         .spawn();
 }
 
-#[tauri::command]
-async fn ollama_models(url: String) -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let v: serde_json::Value = client
-            .get(format!("{}/api/tags", url.trim_end_matches('/')))
-            .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json())
-            .map_err(|_| "Ollama is not reachable".to_string())?;
-        Ok(v["models"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect())
-            .unwrap_or_default())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
+/// (Cleanup no longer lists external LLM models: the clean-up LLM runs in-process via MLX, and the
+/// set of *available* MLX models comes from `crate::cleanup_models` presets + any the user has
+/// installed from HuggingFace — not from an external service.)
 
 #[tauri::command]
 fn model_list() -> Vec<ModelEntry> {
@@ -290,6 +272,94 @@ fn cancel_download(state: State<'_, AppState>) {
     state.download_cancel.store(true, Ordering::Relaxed);
 }
 
+/// One clean-up model option for the UI: a preset or a user-installed HF model.
+#[derive(Serialize, Clone)]
+struct CleanupModelEntry {
+    id: String,
+    label: String,
+    size_mb: u32,
+    is_default: bool,
+    installed: bool,
+    repo: String,
+    /// Added by the user from HuggingFace (removable), rather than a built-in preset.
+    custom: bool,
+}
+
+/// The catalog of clean-up models: the presets plus any model the user added from HuggingFace.
+/// The clean-up LLM runs in-process via Apple MLX — no external daemon.
+#[tauri::command]
+fn cleanup_model_list() -> Vec<CleanupModelEntry> {
+    use crate::cleanup_models as cm;
+    let presets = cm::CLEANUP_MODELS.iter().map(|m| CleanupModelEntry {
+        id: m.id.to_string(),
+        label: m.label.to_string(),
+        size_mb: m.size_mb,
+        is_default: m.is_default,
+        installed: cm::is_installed(m.id),
+        repo: m.repo_id.to_string(),
+        custom: false,
+    });
+    let custom = cm::installed_custom_models().into_iter().map(|m| CleanupModelEntry {
+        label: m.repo.clone(),
+        size_mb: (m.size_bytes / 1_000_000) as u32,
+        is_default: false,
+        installed: true,
+        repo: m.repo,
+        id: m.id,
+        custom: true,
+    });
+    presets.chain(custom).collect()
+}
+
+/// Install a clean-up model by preset id OR an arbitrary HuggingFace repo id/link (e.g.
+/// `qwen3-0.6b-4bit`, `mlx-community/Qwen3-0.6B-4bit`, or a pasted URL). Validation errors
+/// (bad input, unsupported architecture) are returned straight away; the download itself runs
+/// in the background with `cleanup-progress` / `cleanup-done` events, and on success the
+/// dictation worker picks the model up on its next config version bump — no restart needed.
+/// Resolves to the local id the model is installed under, so the UI can select it.
+#[tauri::command]
+fn cleanup_install(app: AppHandle, state: State<'_, AppState>, repo: String) -> Result<String, String> {
+    use crate::cleanup_models as cm;
+    let (local_id, repo_id) = match cm::CLEANUP_MODELS.iter().find(|m| m.id == repo) {
+        Some(m) => (m.id.to_string(), m.repo_id.to_string()),
+        None => {
+            let repo_id = cm::parse_repo(&repo)?;
+            // A pasted link to a preset's repo installs as that preset, not a duplicate.
+            match cm::CLEANUP_MODELS.iter().find(|m| m.repo_id.eq_ignore_ascii_case(&repo_id)) {
+                Some(m) => (m.id.to_string(), m.repo_id.to_string()),
+                None => (cm::sanitize_id(&repo_id), repo_id),
+            }
+        }
+    };
+    if state.downloading.swap(true, Ordering::SeqCst) {
+        return Err("a download is already running".into());
+    }
+    state.download_cancel.store(false, Ordering::Relaxed);
+    let cancel = state.download_cancel.clone();
+    let id = local_id.clone();
+    std::thread::spawn(move || {
+        let progress_app = app.clone();
+        let result = cm::download_from_repo(&id, &repo_id, &cancel, |done, total| {
+            let _ = progress_app.emit("cleanup-progress", DownloadProgress { id: id.clone(), done, total });
+        });
+        let st = app.state::<AppState>();
+        st.downloading.store(false, Ordering::SeqCst);
+        if result.is_ok() {
+            st.shared.poke();
+        }
+        let _ = app.emit("cleanup-done", DownloadResult { id, error: result.err() });
+    });
+    Ok(local_id)
+}
+
+/// Delete a model the user added from HuggingFace.
+#[tauri::command]
+fn cleanup_remove(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    crate::cleanup_models::remove_custom(&id)?;
+    state.shared.poke();
+    Ok(())
+}
+
 #[tauri::command]
 fn login_item_enabled() -> bool {
     crate::launch::login_item_enabled()
@@ -323,7 +393,7 @@ fn sh_quote(p: &std::path::Path) -> String {
 /// Remove Zipscribe from this Mac. The login item is dropped immediately; everything else is
 /// done by a detached shell after the app quits (a running app can't delete its own bundle, and
 /// the permission reset must happen after we stop touching the mic). The app bundle goes to the
-/// Trash so it is recoverable. Ollama and its models are never touched.
+/// Trash so it is recoverable. No external LLM service is touched (cleanup is in-process MLX).
 #[tauri::command]
 fn uninstall_app(app: AppHandle, delete_model: bool, delete_settings: bool) -> Result<(), String> {
     use std::path::PathBuf;
@@ -419,8 +489,10 @@ pub fn run() -> ExitCode {
             request_microphone,
             request_accessibility,
             open_system_settings,
-            ollama_models,
             model_list,
+            cleanup_model_list,
+            cleanup_install,
+            cleanup_remove,
             service_status,
             download_model,
             cancel_download,

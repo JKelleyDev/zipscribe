@@ -1,0 +1,1194 @@
+//! Local jsonl-backed fine-tuning datasets — the data side of mlx-lm
+//! `mlx_lm/tuner/datasets.py` (lines `1..=219`, `309..=332`), cross-referenced
+//! against mlx-swift-lm `MLXLLM/Lora+Data.swift`'s jsonl loader.
+//!
+//! # Surface
+//!
+//! Each dataset type holds a `Vec<serde_json::Value>` (one JSON object per
+//! parsed jsonl line) plus a borrowed [`Tokenizer`] and the per-type config
+//! scalars, mirroring the Python `__init__` shapes:
+//!
+//! - [`TextDataset`] (Python `tuner/datasets.py:11..=36`) — each line has a
+//!   `"text"` field (or a user-overridden `text_key`); [`Dataset::process`]
+//!   returns `(tokenizer.encode(text) + [eos], 0)` — the full sequence is the
+//!   loss target.
+//! - [`ChatDataset`] (Python `tuner/datasets.py:39..=83`) — each line has a
+//!   `"messages"` array (HF chat format) plus optional `"tools"`;
+//!   [`Dataset::process`] runs `tokenizer.apply_chat_template(messages, tools)`
+//!   and (when `mask_prompt`) returns the **prefix-length** as the loss-mask
+//!   `offset` so the trainer can ignore everything before the final assistant
+//!   message.
+//! - [`CompletionsDataset`] (Python `tuner/datasets.py:86..=133`) — each line
+//!   has a `"prompt"` + `"completion"` pair (or user-overridden keys);
+//!   [`Dataset::process`] renders the two as a two-message chat
+//!   (`user`+`assistant`) so the rendering goes through the tokenizer's chat
+//!   template, and (when `mask_prompt`) returns the prompt-prefix length as
+//!   the `offset`.
+//! - [`ConcatenatedDataset`] (Python `tuner/datasets.py:136..=155`) — wraps a
+//!   `Vec<Box<dyn Dataset>>` and indexes ACROSS the inner datasets, routing
+//!   `__getitem__`/`process` to whichever inner dataset owns the index. This
+//!   is **NOT** sequence packing (the Python type does not pack to a fixed
+//!   length; the spec's "packed batches" phrasing is a misnomer); it is a
+//!   plain concat-by-index, exactly as the Python class.
+//! - [`CacheDataset`] (Python `tuner/datasets.py:158..=172`) — memoizes the
+//!   per-index `process()` result the FIRST time an index is touched. Python
+//!   keeps the cache **in-memory per instance** (`self._proc_data = [None] *
+//!   len(data)`), NOT in a sidecar `.cache` file; this port mirrors that
+//!   exactly. A "source mtime change" therefore invalidates the cache via the
+//!   natural mechanism: the next [`load_dataset`] call constructs a fresh
+//!   [`CacheDataset`] whose `_proc_data` starts empty (see
+//!   [the cache-invalidation test](#cache-dataset-invalidates-on-source-mtime-change)).
+//!
+//! And the file-path entry point:
+//!
+//! - [`load_dataset`] (Python `tuner/datasets.py:205..=219`,
+//!   `309..=332`) — reads a local `.jsonl` file, auto-detects the dataset
+//!   type from the first record's shape (Python's `create_dataset`), and
+//!   wraps it in a [`CacheDataset`] (the typical training-time wrapper, as
+//!   `tuner/trainer.py` does).
+//!
+//! # Loss-mask convention — `offset`
+//!
+//! Both Python and this port carry the mask as a SINGLE `usize` offset (not a
+//! per-token `Vec<bool>`): tokens at positions `[0, offset)` are the prompt
+//! prefix and excluded from the training loss; tokens at `[offset, len)` are
+//! the completion and contribute to the loss. `offset == 0` means "no
+//! masking" (the entire sequence is the loss target). `offset == tokens.len()`
+//! would mask the entire sequence (zero loss) and is degenerate — never
+//! produced by the canonical paths.
+//!
+//! The spec's `(token_ids, loss_mask: Vec<bool>)` per-token-bool framing is a
+//! misnomer; the Python reference uses `(tokens, offset)` everywhere and the
+//! training loop builds the bool mask from the offset. Mirroring the Python
+//! shape keeps the data flat, avoids `Vec<bool>` allocations per example, and
+//! preserves bit-for-bit parity with the upstream trainer's expectations.
+//!
+//! # Scope boundary
+//!
+//! - HuggingFace Hub datasets (`load_hf_dataset`, `load_custom_hf_dataset`)
+//!   are **excluded** per the project's local-only policy — see
+//!   [`load_dataset`]'s `hf://`-path rejection. Mirrors the same fence
+//!   already applied in [`crate::lm::lora`] and [`crate::lm::factory`].
+//! - The training-loop side (`tuner/trainer.py`) is blocked on autograd;
+//!   this module ships the data side only.
+//! - Per-model arch hooks are out of scope (no per-model arch porting).
+//!
+//! # Conventions
+//!
+//! - [`Result`]-fallible everywhere; recoverable failures map to typed
+//!   variants: [`Error::FileIo`] / [`Error::Parse`] (IO + jsonl parse),
+//!   [`Error::MissingKey`] / [`Error::OutOfRange`] (missing / wrong-typed
+//!   jsonl fields), [`Error::MalformedData`] (unsupported data format),
+//!   [`Error::EmptyInput`] (empty / blank input), and [`Error::Tokenizer`]
+//!   (chat-template / encode failures).
+//! - The datasets themselves are `Send` (they hold only owned
+//!   [`serde_json::Value`]s and immutable borrows of the [`Tokenizer`]) — no
+//!   `Array` handle is touched on this side of the M3 split.
+//!
+//! [`Error::Tokenizer`]: crate::Error::Tokenizer
+
+use std::{
+  cell::RefCell,
+  io::{BufRead, BufReader},
+  path::Path,
+};
+
+use serde_json::Value;
+
+use smol_str::format_smolstr;
+
+use crate::{
+  error::{
+    CapExceededPayload, EmptyInputPayload, Error, FileIoPayload, FileOp, InvariantViolationPayload,
+    MalformedDataPayload, MissingKeyPayload, OutOfRangePayload, ParsePayload, Result,
+  },
+  tokenizer::Tokenizer,
+};
+
+// ───────────────────────────── defaults ─────────────────────────────
+
+/// Default jsonl field name for [`TextDataset`] — Python
+/// `tuner/datasets.py:20` (`text_key: str = "text"`). Also the default
+/// `text_feature` in `create_dataset` (Python `tuner/datasets.py:182`).
+pub const DEFAULT_TEXT_KEY: &str = "text";
+
+/// Default jsonl field name for [`ChatDataset`] — Python
+/// `tuner/datasets.py:49` (`chat_key: str = "messages"`). Also the default
+/// `chat_feature` in `create_dataset` (Python `tuner/datasets.py:184`).
+pub const DEFAULT_CHAT_KEY: &str = "messages";
+
+/// Default jsonl field name for [`CompletionsDataset`]'s prompt — Python
+/// `tuner/datasets.py:181` (`prompt_feature: str = "prompt"`).
+pub const DEFAULT_PROMPT_KEY: &str = "prompt";
+
+/// Default jsonl field name for [`CompletionsDataset`]'s completion —
+/// Python `tuner/datasets.py:183` (`completion_feature: str = "completion"`).
+pub const DEFAULT_COMPLETION_KEY: &str = "completion";
+
+/// Upper bound on the bytes [`load_dataset`] will read off a single jsonl
+/// file. A training set CAN legitimately be many MiB; this is a defense
+/// against an untrusted path that maps a multi-GiB blob, similar in spirit
+/// to (but generous beyond) [`crate::lm::lora::MAX_ADAPTER_SAFETENSORS_BYTES`].
+/// At 2 GiB we accommodate even very large jsonl shards while still bounding
+/// an obviously hostile mount.
+pub const MAX_DATASET_FILE_BYTES: u64 = 2 << 30;
+
+// ───────────────────────────── trait ─────────────────────────────
+
+/// A processed dataset example: `(token_ids, mask_offset)`.
+///
+/// Tokens at positions `[0, mask_offset)` are the prompt prefix and excluded
+/// from the loss; tokens at `[mask_offset, len)` are the completion. See the
+/// [module-level note on the offset convention](self#loss-mask-convention--offset).
+pub type Example = (Vec<u32>, usize);
+
+/// A pre-tokenization dataset of `(token_ids, mask_offset)` examples.
+///
+/// Mirrors the duck-typed Python `Dataset`-shaped object the trainer reads:
+/// `len()`, `__getitem__(idx)` (here [`Dataset::get`] returning the raw
+/// per-line JSON), and `process(record)` (here [`Dataset::process`] taking
+/// the index directly — Python calls `data[idx]` then `data.process(...)`,
+/// which this port collapses into a single index-keyed entry to keep the
+/// trait `dyn`-safe and to keep all token-id ownership inside the dataset).
+///
+/// `process(idx)` returns `(tokens, offset)` — see the [module-level note
+/// on the offset convention](self#loss-mask-convention--offset).
+pub trait Dataset {
+  /// Number of examples (Python `__len__`,
+  /// `tuner/datasets.py:35,82,132,154,171`).
+  fn len(&self) -> usize;
+
+  /// Is the dataset empty? (`len() == 0`)
+  fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  /// The raw per-line JSON at index `idx` (Python `__getitem__`,
+  /// `tuner/datasets.py:32,79,129,141,166`). Used by
+  /// [`ConcatenatedDataset`]'s routing and by [`CacheDataset`] as the
+  /// argument to a wrapped inner [`Dataset::process`].
+  fn get(&self, idx: usize) -> Result<&Value>;
+
+  /// Tokenize-and-mask the per-index example, returning
+  /// `(tokens, mask_offset)`.
+  ///
+  /// Mirrors Python `tuner/datasets.py` per-type `process(d)`. Errors are
+  /// [`Error::MissingKey`] / [`Error::OutOfRange`] (missing / wrong-typed
+  /// jsonl field) or [`Error::Tokenizer`] (chat-template / encode failure).
+  fn process(&self, idx: usize) -> Result<Example>;
+}
+
+// ───────────────────────────── TextDataset ─────────────────────────────
+
+/// Light-weight wrapper for a jsonl-backed plain-text dataset — Python
+/// `mlx_lm/tuner/datasets.py:11..=36` (`class TextDataset`).
+///
+/// Each parsed jsonl line is expected to be an object with a string under
+/// the configured `text_key` (default [`DEFAULT_TEXT_KEY`]). The
+/// [`Dataset::process`] tokenizes the string and appends the tokenizer's
+/// primary EOS id when missing (Python `tuner/datasets.py:27..=30`), then
+/// returns `(tokens, 0)` — no prompt masking (the entire sequence is the
+/// loss target).
+pub struct TextDataset<'a> {
+  data: Vec<Value>,
+  tokenizer: &'a Tokenizer,
+  text_key: String,
+}
+
+impl std::fmt::Debug for TextDataset<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("TextDataset")
+      .field("len", &self.data.len())
+      .field("text_key", &self.text_key)
+      .finish()
+  }
+}
+
+impl<'a> TextDataset<'a> {
+  /// Construct a [`TextDataset`] from already-parsed jsonl records, mirroring
+  /// Python `TextDataset.__init__` (`tuner/datasets.py:16..=24`).
+  pub fn new(data: Vec<Value>, tokenizer: &'a Tokenizer, text_key: impl Into<String>) -> Self {
+    Self {
+      data,
+      tokenizer,
+      text_key: text_key.into(),
+    }
+  }
+}
+
+impl Dataset for TextDataset<'_> {
+  fn len(&self) -> usize {
+    self.data.len()
+  }
+
+  fn get(&self, idx: usize) -> Result<&Value> {
+    self.data.get(idx).ok_or_else(|| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "TextDataset: index",
+        "must be < len",
+        format_smolstr!("{idx} (len={})", self.data.len()),
+      ))
+    })
+  }
+
+  /// Python `TextDataset.process` (`tuner/datasets.py:26..=30`):
+  /// `d = tokenizer.encode(d[text_key]); if d[-1] != eos: d.append(eos);
+  /// return (d, 0)`.
+  fn process(&self, idx: usize) -> Result<Example> {
+    let record = self.get(idx)?;
+    let text = field_as_str(record, &self.text_key, "TextDataset")?;
+    // Python passes the bare string to `tokenizer.encode`, which adds
+    // special tokens per the tokenizer's defaults. Mirror with
+    // `add_special_tokens = true`.
+    let mut tokens = self.tokenizer.encode(text, true)?;
+    // `tuner/datasets.py:28..=29`: append the primary EOS if the encoded
+    // sequence does not already end with it. A tokenizer with NO primary
+    // EOS leaves the sequence unchanged (matches Python: `eos_token_id`
+    // being `None` falls through the `if d[-1] != None` comparison —
+    // both branches of the python `!= None` against an int are `True`,
+    // so the append would happen; but a `None` eos cannot be appended
+    // either, so the Python path raises. Here we keep the sequence
+    // verbatim and treat a missing eos as a clean no-op — adding `None`
+    // is not representable, and the trainer's loss is well-defined on
+    // an eos-less sequence).
+    if let Some(eos) = self.tokenizer.eos_token_id()
+      && tokens.last() != Some(&eos)
+    {
+      tokens.push(eos);
+    }
+    Ok((tokens, 0))
+  }
+}
+
+// ───────────────────────────── ChatDataset ─────────────────────────────
+
+/// jsonl-backed HF-chat-format dataset — Python
+/// `mlx_lm/tuner/datasets.py:39..=83` (`class ChatDataset`).
+///
+/// Each parsed jsonl line is expected to be an object with a `"messages"`
+/// array under the configured `chat_key` (default [`DEFAULT_CHAT_KEY`]) and
+/// optional `"tools"` field. The [`Dataset::process`] runs
+/// [`Tokenizer::apply_chat_template_ids`] on the messages (Python
+/// `tuner/datasets.py:60..=64`), and (when `mask_prompt`) renders the
+/// `messages[:-1]` prefix with `add_generation_prompt` set to whether the
+/// final message is from the `assistant` role, returning the prefix length
+/// as the loss-mask offset (Python `tuner/datasets.py:65..=75`).
+pub struct ChatDataset<'a> {
+  data: Vec<Value>,
+  tokenizer: &'a Tokenizer,
+  chat_key: String,
+  mask_prompt: bool,
+}
+
+impl std::fmt::Debug for ChatDataset<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ChatDataset")
+      .field("len", &self.data.len())
+      .field("chat_key", &self.chat_key)
+      .field("mask_prompt", &self.mask_prompt)
+      .finish()
+  }
+}
+
+impl<'a> ChatDataset<'a> {
+  /// Construct a [`ChatDataset`] from already-parsed jsonl records, mirroring
+  /// Python `ChatDataset.__init__` (`tuner/datasets.py:45..=55`).
+  pub fn new(
+    data: Vec<Value>,
+    tokenizer: &'a Tokenizer,
+    chat_key: impl Into<String>,
+    mask_prompt: bool,
+  ) -> Self {
+    Self {
+      data,
+      tokenizer,
+      chat_key: chat_key.into(),
+      mask_prompt,
+    }
+  }
+}
+
+impl Dataset for ChatDataset<'_> {
+  fn len(&self) -> usize {
+    self.data.len()
+  }
+
+  fn get(&self, idx: usize) -> Result<&Value> {
+    self.data.get(idx).ok_or_else(|| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "ChatDataset: index",
+        "must be < len",
+        format_smolstr!("{idx} (len={})", self.data.len()),
+      ))
+    })
+  }
+
+  /// Python `ChatDataset.process` (`tuner/datasets.py:57..=77`).
+  fn process(&self, idx: usize) -> Result<Example> {
+    let record = self.get(idx)?;
+    let messages = record.get(&self.chat_key).ok_or_else(|| {
+      Error::MissingKey(MissingKeyPayload::new(
+        "ChatDataset: jsonl record missing field",
+        self.chat_key.as_str(),
+      ))
+    })?;
+    if !messages.is_array() {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "ChatDataset: chat field JSON kind (must be array)",
+        "must be a JSON array",
+        format_smolstr!("{}={}", self.chat_key, json_kind(messages)),
+      )));
+    }
+    let tools = record.get("tools");
+    let tokens = self
+      .tokenizer
+      .apply_chat_template_ids(messages, tools, false, false, None)?;
+
+    if !self.mask_prompt {
+      return Ok((tokens, 0));
+    }
+
+    // Python `messages[:-1]` + `add_generation_prompt = messages[-1]["role"]
+    // == "assistant"`. The prefix encode determines the offset (only the
+    // length is needed; we discard the prefix ids).
+    let arr = messages
+      .as_array()
+      .expect("messages.is_array() was checked above");
+    let last_role = arr
+      .last()
+      .and_then(|m| m.get("role"))
+      .and_then(Value::as_str);
+    let add_generation_prompt = last_role == Some("assistant");
+    let prefix = Value::Array(arr[..arr.len().saturating_sub(1)].to_vec());
+    let prefix_tokens =
+      self
+        .tokenizer
+        .apply_chat_template_ids(&prefix, tools, add_generation_prompt, false, None)?;
+    Ok((tokens, prefix_tokens.len()))
+  }
+}
+
+// ───────────────────────────── CompletionsDataset ─────────────────────────────
+
+/// jsonl-backed prompt/completion dataset — Python
+/// `mlx_lm/tuner/datasets.py:86..=133` (`class CompletionsDataset`).
+///
+/// Each parsed jsonl line is expected to be an object with a string under
+/// `prompt_key` and a string under `completion_key` (defaults
+/// [`DEFAULT_PROMPT_KEY`] / [`DEFAULT_COMPLETION_KEY`]). The two are
+/// wrapped in a synthetic two-message chat (`{role: user, content: prompt}`,
+/// `{role: assistant, content: completion}`) and rendered through the
+/// tokenizer's chat template (Python `tuner/datasets.py:108..=115`).
+///
+/// When `mask_prompt`, the prefix `messages[:-1]` (i.e. just the user
+/// prompt) is rendered with `add_generation_prompt = true` and its length
+/// returned as the loss-mask offset (Python `tuner/datasets.py:116..=125`).
+pub struct CompletionsDataset<'a> {
+  data: Vec<Value>,
+  tokenizer: &'a Tokenizer,
+  prompt_key: String,
+  completion_key: String,
+  mask_prompt: bool,
+}
+
+impl std::fmt::Debug for CompletionsDataset<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("CompletionsDataset")
+      .field("len", &self.data.len())
+      .field("prompt_key", &self.prompt_key)
+      .field("completion_key", &self.completion_key)
+      .field("mask_prompt", &self.mask_prompt)
+      .finish()
+  }
+}
+
+impl<'a> CompletionsDataset<'a> {
+  /// Construct a [`CompletionsDataset`] from already-parsed jsonl records,
+  /// mirroring Python `CompletionsDataset.__init__`
+  /// (`tuner/datasets.py:93..=105`).
+  pub fn new(
+    data: Vec<Value>,
+    tokenizer: &'a Tokenizer,
+    prompt_key: impl Into<String>,
+    completion_key: impl Into<String>,
+    mask_prompt: bool,
+  ) -> Self {
+    Self {
+      data,
+      tokenizer,
+      prompt_key: prompt_key.into(),
+      completion_key: completion_key.into(),
+      mask_prompt,
+    }
+  }
+}
+
+impl Dataset for CompletionsDataset<'_> {
+  fn len(&self) -> usize {
+    self.data.len()
+  }
+
+  fn get(&self, idx: usize) -> Result<&Value> {
+    self.data.get(idx).ok_or_else(|| {
+      Error::OutOfRange(OutOfRangePayload::new(
+        "CompletionsDataset: index",
+        "must be < len",
+        format_smolstr!("{idx} (len={})", self.data.len()),
+      ))
+    })
+  }
+
+  /// Python `CompletionsDataset.process` (`tuner/datasets.py:107..=127`).
+  fn process(&self, idx: usize) -> Result<Example> {
+    let record = self.get(idx)?;
+    let prompt = field_as_str(record, &self.prompt_key, "CompletionsDataset")?;
+    let completion = field_as_str(record, &self.completion_key, "CompletionsDataset")?;
+    let tools = record.get("tools");
+
+    let messages = serde_json::json!([
+      { "role": "user", "content": prompt },
+      { "role": "assistant", "content": completion },
+    ]);
+    let tokens = self
+      .tokenizer
+      .apply_chat_template_ids(&messages, tools, false, false, None)?;
+
+    if !self.mask_prompt {
+      return Ok((tokens, 0));
+    }
+
+    // Python `messages[:-1]` rendered with `add_generation_prompt = True`
+    // (the user-only prefix that conditions the assistant turn).
+    let prefix = serde_json::json!([
+      { "role": "user", "content": prompt },
+    ]);
+    let prefix_tokens = self
+      .tokenizer
+      .apply_chat_template_ids(&prefix, tools, true, false, None)?;
+    Ok((tokens, prefix_tokens.len()))
+  }
+}
+
+// ───────────────────────────── ConcatenatedDataset ─────────────────────────────
+
+/// Concat-by-index wrapper across multiple inner datasets — Python
+/// `mlx_lm/tuner/datasets.py:136..=155` (`class ConcatenatedDataset`).
+///
+/// This is **NOT** sequence packing: it routes index access across the
+/// sequence of inner datasets in declaration order. An index `idx` is
+/// resolved by subtracting each inner `len()` in turn until the routed
+/// inner is found (exactly Python's `for data_idx, data in enumerate(...);
+/// j = idx - len(data); if j < 0: break; idx = j`).
+///
+/// `get(idx)` dispatches through to the inner dataset's `get`; `process(idx)`
+/// dispatches through to the inner dataset's `process`. This matches the
+/// Python class shape EXCEPT for one Python-specific tag-write: Python's
+/// `__getitem__` mutates the returned `dict` with a `"_dataset"` key so
+/// `process(d)` can route back to the original sub-dataset. This port
+/// routes by **index** instead (which avoids the mutating side-effect and
+/// keeps `&Value` purely immutable), preserving the observable behavior.
+pub struct ConcatenatedDataset<'a> {
+  data: Vec<Box<dyn Dataset + 'a>>,
+  len: usize,
+}
+
+impl std::fmt::Debug for ConcatenatedDataset<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ConcatenatedDataset")
+      .field("inner_count", &self.data.len())
+      .field("len", &self.len)
+      .finish()
+  }
+}
+
+impl<'a> ConcatenatedDataset<'a> {
+  /// Construct a [`ConcatenatedDataset`] from a sequence of inner datasets,
+  /// mirroring Python `ConcatenatedDataset.__init__`
+  /// (`tuner/datasets.py:137..=139`: `_len = sum(len(d) for d in _data)`).
+  pub fn new(data: Vec<Box<dyn Dataset + 'a>>) -> Self {
+    let len = data.iter().map(|d| d.len()).sum();
+    Self { data, len }
+  }
+
+  /// Resolve a global `idx` into `(inner_dataset_index, local_idx)` —
+  /// the Python `for data_idx, data in enumerate(...); j = idx - len(data);
+  /// if j < 0: break; idx = j` traversal.
+  fn resolve(&self, idx: usize) -> Result<(usize, usize)> {
+    let mut remaining = idx;
+    for (data_idx, inner) in self.data.iter().enumerate() {
+      if remaining < inner.len() {
+        return Ok((data_idx, remaining));
+      }
+      remaining -= inner.len();
+    }
+    Err(Error::OutOfRange(OutOfRangePayload::new(
+      "ConcatenatedDataset: index",
+      "must be < len",
+      format_smolstr!("{idx} (len={})", self.len),
+    )))
+  }
+}
+
+impl Dataset for ConcatenatedDataset<'_> {
+  fn len(&self) -> usize {
+    self.len
+  }
+
+  fn get(&self, idx: usize) -> Result<&Value> {
+    let (di, li) = self.resolve(idx)?;
+    self.data[di].get(li)
+  }
+
+  fn process(&self, idx: usize) -> Result<Example> {
+    let (di, li) = self.resolve(idx)?;
+    self.data[di].process(li)
+  }
+}
+
+// ───────────────────────────── CacheDataset ─────────────────────────────
+
+/// In-memory `process()` memoizer — Python
+/// `mlx_lm/tuner/datasets.py:158..=172` (`class CacheDataset`).
+///
+/// Wraps an inner [`Dataset`] and lazily caches the per-index
+/// `(tokens, offset)` pair the first time it is requested
+/// (`tuner/datasets.py:167..=169`: `if self._proc_data[idx] is None:
+/// self._proc_data[idx] = self._data.process(self._data[idx])`).
+///
+/// Python's cache is in-memory only (`self._proc_data = [None] *
+/// len(data)`); there is **no** sidecar `.cache` file. A source-jsonl mtime
+/// change invalidates the cache via the natural mechanism: the next
+/// [`load_dataset`] call constructs a fresh [`CacheDataset`] whose
+/// `_proc_data` starts empty.
+///
+/// Interior mutability ([`RefCell`]) keeps [`Dataset::process`] taking
+/// `&self`, matching the trait and the Python `__getitem__` shape.
+pub struct CacheDataset<'a> {
+  data: Box<dyn Dataset + 'a>,
+  proc_data: RefCell<Vec<Option<Example>>>,
+}
+
+impl std::fmt::Debug for CacheDataset<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let cached = self
+      .proc_data
+      .try_borrow()
+      .map(|c| c.iter().filter(|e| e.is_some()).count())
+      .ok();
+    f.debug_struct("CacheDataset")
+      .field("len", &self.data.len())
+      .field("cached_count", &cached)
+      .finish()
+  }
+}
+
+impl<'a> CacheDataset<'a> {
+  /// Wrap an inner dataset and pre-size the cache to `inner.len()`.
+  pub fn new(data: Box<dyn Dataset + 'a>) -> Self {
+    let n = data.len();
+    Self {
+      data,
+      proc_data: RefCell::new(vec![None; n]),
+    }
+  }
+
+  /// Cached token-sequence length at `idx` — Python `itemlen`
+  /// (`tuner/datasets.py:163..=164`: `len(self._data[idx])`).
+  /// Returns the cached `tokens.len()` if the entry is already processed,
+  /// else freshly processes and caches it.
+  pub fn item_len(&self, idx: usize) -> Result<usize> {
+    let cached = self.process(idx)?;
+    Ok(cached.0.len())
+  }
+}
+
+impl Dataset for CacheDataset<'_> {
+  fn len(&self) -> usize {
+    self.data.len()
+  }
+
+  fn get(&self, idx: usize) -> Result<&Value> {
+    self.data.get(idx)
+  }
+
+  /// Python `CacheDataset.__getitem__` — lazy populate then return.
+  ///
+  /// Returns the cached pair as a fresh clone each call. The clone is
+  /// cheap (a `Vec<u32>`) and keeps the trait `dyn`-safe by not exposing
+  /// a `Ref` into the [`RefCell`] (whose borrow lifetime would leak into
+  /// the trait method's return type via a generic associated type, which
+  /// is not `dyn`-compatible).
+  fn process(&self, idx: usize) -> Result<Example> {
+    {
+      let cache = self.proc_data.borrow();
+      if let Some(Some(pair)) = cache.get(idx) {
+        return Ok(pair.clone());
+      }
+    }
+    // Compute outside any borrow.
+    let computed = self.data.process(idx)?;
+    let mut cache = self.proc_data.borrow_mut();
+    if idx >= cache.len() {
+      return Err(Error::OutOfRange(OutOfRangePayload::new(
+        "CacheDataset: index",
+        "must be < len",
+        format_smolstr!("{idx} (len={})", cache.len()),
+      )));
+    }
+    cache[idx] = Some(computed.clone());
+    Ok(computed)
+  }
+}
+
+// ───────────────────────────── factory ─────────────────────────────
+
+/// What dataset shape to construct — the explicit form of Python
+/// `create_dataset`'s sample-driven dispatch
+/// (`tuner/datasets.py:175..=202`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
+pub enum DatasetType {
+  /// Tokenize a single `text` field verbatim — see [`TextDataset`].
+  Text,
+  /// Apply the chat template to a `messages` array — see [`ChatDataset`].
+  Chat,
+  /// Render a `prompt`+`completion` pair as a two-turn chat — see
+  /// [`CompletionsDataset`].
+  Completions,
+  /// Auto-detect from the FIRST jsonl record's fields, mirroring Python
+  /// `create_dataset`'s sample-driven dispatch:
+  /// `prompt` + `completion` ⇒ [`DatasetType::Completions`]; else
+  /// `messages` ⇒ [`DatasetType::Chat`]; else `text` ⇒ [`DatasetType::Text`];
+  /// else error.
+  Auto,
+}
+
+impl DatasetType {
+  /// Returns the canonical string representation of this variant:
+  /// `"text"`, `"chat"`, `"completions"`, or `"auto"`.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      DatasetType::Text => "text",
+      DatasetType::Chat => "chat",
+      DatasetType::Completions => "completions",
+      DatasetType::Auto => "auto",
+    }
+  }
+}
+
+/// Per-call dataset config — the typed analogue of Python's
+/// `types.SimpleNamespace`-style `config` argument to `create_dataset`
+/// (`tuner/datasets.py:175..=202`).
+///
+/// The defaults mirror Python's `getattr(config, ..., default)` defaults
+/// exactly:
+/// - `mask_prompt = false` (Python `tuner/datasets.py:180`)
+/// - `prompt_feature = "prompt"` (Python `tuner/datasets.py:181`)
+/// - `text_feature = "text"` (Python `tuner/datasets.py:182`)
+/// - `completion_feature = "completion"` (Python `tuner/datasets.py:183`)
+/// - `chat_feature = "messages"` (Python `tuner/datasets.py:184`)
+#[derive(Debug, Clone)]
+pub struct DatasetConfig {
+  /// Whether to set the prompt-mask offset (the `(tokens, offset)`'s second
+  /// element). When `false`, every dataset returns `(tokens, 0)`.
+  mask_prompt: bool,
+  /// jsonl field name for [`TextDataset`].
+  text_feature: String,
+  /// jsonl field name for [`ChatDataset`].
+  chat_feature: String,
+  /// jsonl field name for [`CompletionsDataset`]'s prompt.
+  prompt_feature: String,
+  /// jsonl field name for [`CompletionsDataset`]'s completion.
+  completion_feature: String,
+}
+
+impl DatasetConfig {
+  /// Construct a [`DatasetConfig`] with the Python-default values.
+  ///
+  /// Equivalent to [`DatasetConfig::default()`]; prefer `.with_*` builder
+  /// methods to override individual fields.
+  pub fn new() -> Self {
+    Self {
+      mask_prompt: false,
+      text_feature: DEFAULT_TEXT_KEY.to_owned(),
+      chat_feature: DEFAULT_CHAT_KEY.to_owned(),
+      prompt_feature: DEFAULT_PROMPT_KEY.to_owned(),
+      completion_feature: DEFAULT_COMPLETION_KEY.to_owned(),
+    }
+  }
+
+  /// Whether prompt masking is enabled.
+  #[inline(always)]
+  pub fn mask_prompt(&self) -> bool {
+    self.mask_prompt
+  }
+
+  /// The jsonl field name used for [`TextDataset`].
+  #[inline(always)]
+  pub fn text_feature(&self) -> &str {
+    &self.text_feature
+  }
+
+  /// The jsonl field name used for [`ChatDataset`].
+  #[inline(always)]
+  pub fn chat_feature(&self) -> &str {
+    &self.chat_feature
+  }
+
+  /// The jsonl field name used for [`CompletionsDataset`]'s prompt.
+  #[inline(always)]
+  pub fn prompt_feature(&self) -> &str {
+    &self.prompt_feature
+  }
+
+  /// The jsonl field name used for [`CompletionsDataset`]'s completion.
+  #[inline(always)]
+  pub fn completion_feature(&self) -> &str {
+    &self.completion_feature
+  }
+
+  /// Set `mask_prompt`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_mask_prompt(mut self, mask_prompt: bool) -> Self {
+    self.mask_prompt = mask_prompt;
+    self
+  }
+
+  /// Set `text_feature`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_text_feature(mut self, text_feature: impl Into<String>) -> Self {
+    self.text_feature = text_feature.into();
+    self
+  }
+
+  /// Set `chat_feature`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_chat_feature(mut self, chat_feature: impl Into<String>) -> Self {
+    self.chat_feature = chat_feature.into();
+    self
+  }
+
+  /// Set `prompt_feature`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_prompt_feature(mut self, prompt_feature: impl Into<String>) -> Self {
+    self.prompt_feature = prompt_feature.into();
+    self
+  }
+
+  /// Set `completion_feature`. Returns `self` for chaining.
+  #[must_use]
+  pub fn with_completion_feature(mut self, completion_feature: impl Into<String>) -> Self {
+    self.completion_feature = completion_feature.into();
+    self
+  }
+}
+
+impl Default for DatasetConfig {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// Build the right dataset type from already-parsed jsonl records — Python
+/// `create_dataset` (`tuner/datasets.py:175..=202`).
+///
+/// `data` is the parsed jsonl (one [`Value`] per line). The first record's
+/// shape drives auto-detection: `prompt_feature` + `completion_feature` ⇒
+/// [`CompletionsDataset`]; `chat_feature` ⇒ [`ChatDataset`]; `text_feature`
+/// ⇒ [`TextDataset`]; else an [`Error::MalformedData`] with the same
+/// "Unsupported data format" message as Python `tuner/datasets.py:199..=202`.
+///
+/// `mask_prompt` on a [`DatasetType::Text`] is an error
+/// ([`Error::InvariantViolation`]), mirroring Python `tuner/datasets.py:195..=196`:
+/// `raise ValueError("Prompt masking not supported for text dataset.")`.
+pub fn create_dataset<'a>(
+  data: Vec<Value>,
+  tokenizer: &'a Tokenizer,
+  config: &DatasetConfig,
+  dataset_type: DatasetType,
+) -> Result<Box<dyn Dataset + 'a>> {
+  let resolved = match dataset_type {
+    DatasetType::Auto => auto_detect(&data, config)?,
+    other => other,
+  };
+  match resolved {
+    DatasetType::Text => {
+      if config.mask_prompt() {
+        return Err(Error::InvariantViolation(InvariantViolationPayload::new(
+          "create_dataset: prompt masking",
+          "is not supported for text dataset",
+        )));
+      }
+      Ok(Box::new(TextDataset::new(
+        data,
+        tokenizer,
+        config.text_feature().to_owned(),
+      )))
+    }
+    DatasetType::Chat => Ok(Box::new(ChatDataset::new(
+      data,
+      tokenizer,
+      config.chat_feature().to_owned(),
+      config.mask_prompt(),
+    ))),
+    DatasetType::Completions => Ok(Box::new(CompletionsDataset::new(
+      data,
+      tokenizer,
+      config.prompt_feature().to_owned(),
+      config.completion_feature().to_owned(),
+      config.mask_prompt(),
+    ))),
+    DatasetType::Auto => unreachable!("auto_detect returned Auto"),
+  }
+}
+
+/// Python `tuner/datasets.py:185..=202` — `sample = data[0]` field
+/// detection.
+fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
+  let sample = data.first().ok_or_else(|| {
+    Error::EmptyInput(EmptyInputPayload::new(
+      "create_dataset: jsonl records for auto-detection (pass an explicit DatasetType instead)",
+    ))
+  })?;
+  let has = |k: &str| sample.get(k).is_some();
+  if has(config.prompt_feature()) && has(config.completion_feature()) {
+    Ok(DatasetType::Completions)
+  } else if has(config.chat_feature()) {
+    Ok(DatasetType::Chat)
+  } else if has(config.text_feature()) {
+    Ok(DatasetType::Text)
+  } else {
+    // Match Python `tuner/datasets.py:199..=202` verbatim.
+    Err(Error::MalformedData(MalformedDataPayload::new(
+      "create_dataset: auto-detect",
+      "Unsupported data format, check the supported formats here:\n\
+                https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md#Data.",
+    )))
+  }
+}
+
+// ───────────────────────────── load_dataset ─────────────────────────────
+
+/// Load a single local jsonl file as a [`CacheDataset`]-wrapped
+/// [`TextDataset`] / [`ChatDataset`] / [`CompletionsDataset`].
+///
+/// The Python entry point (`mlx_lm/tuner/datasets.py:309..=332`) dispatches
+/// over a `(train, valid, test)` triple of jsonl files in a directory; this
+/// port exposes the per-file primitive so callers can build that triple
+/// themselves (and skip `valid` / `test` cleanly when absent — Python
+/// returns an empty list, here the caller chooses not to call). The wrap
+/// in a [`CacheDataset`] mirrors what Python `tuner/trainer.py` does at
+/// the consume site.
+///
+/// `dataset_type` chooses the dataset shape explicitly; pass
+/// [`DatasetType::Auto`] to mirror Python's `create_dataset` sample-driven
+/// dispatch.
+///
+/// # Errors
+///
+/// - HuggingFace Hub paths (`hf://...`-prefixed) are rejected with a clear
+///   [`Error::OutOfRange`] error — they are out of scope per the project's
+///   local-only policy (see [the module docs](self#scope-boundary)).
+/// - A non-regular file (directory, socket, …) is rejected after open;
+///   the [`Path`] must point at an actual file.
+/// - An oversized file (above [`MAX_DATASET_FILE_BYTES`]) is rejected
+///   on a metadata check bound to the OPEN file handle (TOCTOU-safe),
+///   AND a cumulative byte counter enforces the same cap DURING the
+///   read loop in case the file grows mid-read; a hostile mount cannot
+///   push an unbounded blob into memory.
+/// - A blank line in the jsonl file is rejected with line-number context
+///   (matches Python's `json.loads(l)` which errors on `""`); silently
+///   dropping blanks would shift every subsequent record's index and
+///   mask data-corruption upstream.
+/// - An empty file is rejected with the path in the error message;
+///   silently constructing an empty dataset would mask a missing-shard
+///   bug downstream in training. Callers wanting "skip absent splits"
+///   should check for file presence themselves.
+/// - A malformed jsonl line surfaces as [`Error::Parse`] with the
+///   call-site context.
+pub fn load_dataset<'a>(
+  path: &Path,
+  tokenizer: &'a Tokenizer,
+  dataset_type: DatasetType,
+  config: &DatasetConfig,
+) -> Result<CacheDataset<'a>> {
+  // Reject HF Hub URIs up front. Python `tuner/datasets.py:309..=318`
+  // routes non-existent local paths to `load_hf_dataset`; this port
+  // **excludes** the HF Hub side entirely.
+  if let Some(s) = path.to_str()
+    && (s.starts_with("hf://") || s.starts_with("hf:"))
+  {
+    return Err(Error::OutOfRange(OutOfRangePayload::new(
+      "create_dataset: HF Hub URI rejected (local-only mlxrs build)",
+      "pass a local jsonl file path instead",
+      format_smolstr!("{s}"),
+    )));
+  }
+
+  if !path.exists() {
+    return Err(Error::FileIo(FileIoPayload::new(
+      "open jsonl",
+      FileOp::Open,
+      ::std::path::PathBuf::from(path),
+      std::io::Error::from(std::io::ErrorKind::NotFound),
+    )));
+  }
+
+  // Open FIRST, then validate against the handle's own metadata. This
+  // closes a TOCTOU window where a metadata() check could be bypassed
+  // by a symlink swap or by an append between the check and the read.
+  //
+  // On Unix the open uses `O_NONBLOCK | O_CLOEXEC` (mirroring
+  // [`crate::lm::lora`], [`crate::lm::load`], and
+  // [`crate::embeddings::config`]) so that a planted FIFO (or symlink
+  // → FIFO) at `path` cannot wedge a blocking `open()` on a missing
+  // writer; the call returns immediately and the post-open
+  // `is_file()` check below rejects the non-regular target before any
+  // read is attempted. `O_NONBLOCK` is a no-op for regular files
+  // (Linux/macOS), so the subsequent reads remain blocking as
+  // expected. `O_CLOEXEC` keeps the fd from leaking into child
+  // processes.
+  #[cfg(unix)]
+  let file = {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+      .open(path)
+      .map_err(|e| {
+        Error::FileIo(FileIoPayload::new(
+          "open jsonl",
+          FileOp::Open,
+          ::std::path::PathBuf::from(path),
+          e,
+        ))
+      })?
+  };
+  #[cfg(not(unix))]
+  let file = std::fs::File::open(path).map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "open jsonl",
+      FileOp::Open,
+      ::std::path::PathBuf::from(path),
+      e,
+    ))
+  })?;
+  let meta = file.metadata().map_err(|e| {
+    Error::FileIo(FileIoPayload::new(
+      "stat jsonl",
+      FileOp::Stat,
+      ::std::path::PathBuf::from(path),
+      e,
+    ))
+  })?;
+  if !meta.is_file() {
+    return Err(Error::FileIo(FileIoPayload::new(
+      "open jsonl: not a regular file (directories, sockets, FIFOs etc. are not accepted)",
+      FileOp::Stat,
+      ::std::path::PathBuf::from(path),
+      std::io::Error::from(std::io::ErrorKind::InvalidInput),
+    )));
+  }
+  if meta.len() > MAX_DATASET_FILE_BYTES {
+    return Err(Error::CapExceeded(CapExceededPayload::new(
+      "open jsonl: file size",
+      "MAX_DATASET_FILE_BYTES",
+      MAX_DATASET_FILE_BYTES,
+      meta.len(),
+    )));
+  }
+
+  // Delegate the read+parse loop to a path-agnostic helper so that
+  // tests can drive it through any `BufRead` (e.g. an in-memory cursor
+  // backed by a small synthetic cap) without having to materialize a
+  // cap-sized file on disk.
+  let data = read_jsonl_with_cap(BufReader::new(file), path, MAX_DATASET_FILE_BYTES)?;
+
+  if data.is_empty() {
+    return Err(Error::EmptyInput(EmptyInputPayload::new(
+      "open jsonl: parsed records (file is empty; skip absent valid.jsonl/test.jsonl at caller level)",
+    )));
+  }
+
+  let inner = create_dataset(data, tokenizer, config, dataset_type)?;
+  Ok(CacheDataset::new(inner))
+}
+
+/// Read a jsonl stream and parse each line, enforcing a cumulative
+/// byte cap DURING the read loop. This is the path-agnostic core
+/// invoked by [`load_dataset`]; tests drive it through an in-memory
+/// `Cursor` with a small synthetic `max_bytes` to exercise the
+/// in-loop overflow path without materializing a cap-sized fixture.
+///
+/// `path_for_errors` is interpolated into error messages only — it
+/// does NOT have to point at an actual file. A blank line is rejected
+/// (silently dropping blanks would shift every subsequent record's
+/// 1-based index and could mask data corruption).
+///
+/// # Why a manual `read_until` instead of `BufRead::lines()`
+///
+/// `BufRead::lines()` reads a FULL line into a `String` BEFORE
+/// yielding, so a single mid-read-grown gigantic line (or a hostile
+/// stream containing one giant unterminated line) would allocate
+/// arbitrarily many bytes BEFORE the post-yield cap check could fire
+/// → OOM. The manual `read_until` bounds EACH per-iteration read at
+/// `remaining + 1` bytes via `(&mut reader).take(remaining + 1)`:
+/// this enforces the cap on the read ITSELF (the `BufReader` cannot
+/// pull more than `remaining + 1` bytes into the line buffer per
+/// iteration), and the post-read cumulative check rejects on the
+/// `+1` overflow byte. A million-byte single line at file start with
+/// a 1000-byte cap therefore reads at most 1001 bytes before erroring.
+fn read_jsonl_with_cap<R: BufRead>(
+  mut reader: R,
+  path_for_errors: &Path,
+  max_bytes: u64,
+) -> Result<Vec<Value>> {
+  let mut data: Vec<Value> = Vec::new();
+  let mut total_bytes: u64 = 0;
+  let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
+  loop {
+    line_buf.clear();
+    let remaining = max_bytes.saturating_sub(total_bytes);
+    if remaining == 0 {
+      // No budget left. If the reader still has bytes pending, that
+      // is a cap overflow; if it's at EOF, normal exit.
+      let mut peek = [0u8; 1];
+      let n = std::io::Read::read(&mut reader, &mut peek).map_err(|e| {
+        Error::FileIo(FileIoPayload::new(
+          "read jsonl: probing post-cap bytes",
+          FileOp::Read,
+          ::std::path::PathBuf::from(path_for_errors),
+          e,
+        ))
+      })?;
+      if n == 0 {
+        break;
+      }
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "read jsonl: cumulative bytes (more bytes remained in reader past the cap)",
+        "MAX_DATASET_FILE_BYTES",
+        max_bytes,
+        total_bytes.saturating_add(1),
+      )));
+    }
+    // Cap THIS line's read at `remaining + 1` so we detect the
+    // overflow on the `+1` byte rather than allocating arbitrarily.
+    // `Read::take(limit)` ENFORCES the cap on the read itself — the
+    // buffered reader cannot allocate more than `limit` bytes per
+    // iteration. We then check the cumulative byte count post-read
+    // to confirm the cap. `remaining + 1` cannot overflow u64
+    // because `remaining <= max_bytes <= u64::MAX - 1` (max_bytes is
+    // 2 GiB in production); we guard with saturating_add anyway.
+    let cap_this_line = remaining.saturating_add(1);
+    // `Read::take` consumes `Self`; calling it on `&mut R` (which is
+    // itself `Read` via the blanket `impl<R: Read + ?Sized> Read for
+    // &mut R`) borrows the inner reader for the duration of `take`
+    // without moving it. We then drive `BufRead::read_until` on the
+    // `Take<&mut R>` adapter, which is itself `BufRead` via the
+    // `impl<T: BufRead> BufRead for Take<T>` blanket. After this
+    // borrow ends the original `reader` is usable again for the next
+    // iteration.
+    let mut take = <&mut R as std::io::Read>::take(&mut reader, cap_this_line);
+    let n = match std::io::BufRead::read_until(&mut take, b'\n', &mut line_buf) {
+      Ok(n) => n,
+      Err(e) => {
+        return Err(Error::FileIo(FileIoPayload::new(
+          "read jsonl: read_until",
+          FileOp::Read,
+          ::std::path::PathBuf::from(path_for_errors),
+          e,
+        )));
+      }
+    };
+    if n == 0 {
+      // EOF.
+      break;
+    }
+    total_bytes = total_bytes.saturating_add(n as u64);
+    // The cumulative cap is enforced INSIDE the read loop so that a
+    // file which grows between the pre-open metadata check and the
+    // actual read (or a custom reader that streams more bytes than
+    // its metadata advertised) cannot bypass the cap. Combined with
+    // the per-iteration `take(remaining + 1)`, this also rejects a
+    // SINGLE giant line that alone exceeds the cap without
+    // allocating past `remaining + 1` bytes.
+    if total_bytes > max_bytes {
+      return Err(Error::CapExceeded(CapExceededPayload::new(
+        "read jsonl: cumulative bytes (file may have grown mid-read or per-line size is unexpectedly large)",
+        "MAX_DATASET_FILE_BYTES",
+        max_bytes,
+        total_bytes,
+      )));
+    }
+    // Strip the trailing newline for downstream parsing, if any.
+    if line_buf.last() == Some(&b'\n') {
+      line_buf.pop();
+      // Also strip a preceding CR (Windows-style line endings).
+      if line_buf.last() == Some(&b'\r') {
+        line_buf.pop();
+      }
+    }
+    // Bytes were read into `line_buf`; treat the contents as UTF-8
+    // for the parsing path that follows.
+    let line = std::str::from_utf8(&line_buf).map_err(|e| {
+      Error::Parse(ParsePayload::new(
+        "read jsonl: line is not valid UTF-8",
+        "jsonl line UTF-8",
+        Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+      ))
+    })?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+      // Python `tuner/datasets.py` does `[json.loads(l) for l in fid]`,
+      // which raises on an empty string. Silently dropping a blank
+      // would shift subsequent indices and mask corruption.
+      return Err(Error::EmptyInput(EmptyInputPayload::new(
+        "read jsonl: blank line (every line must be a valid JSON record; matches Python `json.loads(l)` failing on \"\")",
+      )));
+    }
+    let v: Value = serde_json::from_str(trimmed).map_err(|e| {
+      Error::Parse(ParsePayload::new(
+        "read jsonl: serde_json::from_str",
+        "jsonl record",
+        Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+      ))
+    })?;
+    data.push(v);
+  }
+  Ok(data)
+}
+
+// ───────────────────────────── helpers ─────────────────────────────
+
+/// Extract a string field from a jsonl record, returning a clean error
+/// when missing or wrong-typed.
+fn field_as_str<'a>(record: &'a Value, key: &str, type_name: &'static str) -> Result<&'a str> {
+  let v = record.get(key).ok_or_else(|| {
+    Error::MissingKey(MissingKeyPayload::new(
+      type_name,
+      format_smolstr!("jsonl record missing '{key}'"),
+    ))
+  })?;
+  v.as_str().ok_or_else(|| {
+    Error::OutOfRange(OutOfRangePayload::new(
+      type_name,
+      "field must be a JSON string",
+      format_smolstr!("'{key}'={}", json_kind(v)),
+    ))
+  })
+}
+
+/// Brief tag for a JSON value's kind, for error messages.
+fn json_kind(v: &Value) -> &'static str {
+  match v {
+    Value::Null => "null",
+    Value::Bool(_) => "bool",
+    Value::Number(_) => "number",
+    Value::String(_) => "string",
+    Value::Array(_) => "array",
+    Value::Object(_) => "object",
+  }
+}
+
+#[cfg(test)]
+mod tests;

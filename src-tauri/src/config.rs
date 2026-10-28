@@ -6,7 +6,7 @@
 //!   * Round-trippable: a `Config` serializes to TOML and deserializes back identically.
 //!
 //! The config file is the user-facing knob set (also surfaced in the tray menu):
-//! `hotkey`, `cleanup_*` (Ollama endpoint + model + toggle), `output_mode`, and `enabled`.
+//! `hotkey`, `cleanup_*` (in-process MLX model + toggle), `output_mode`, and `enabled`.
 //! The nested sections described in docs/SPEC.md are flattened here for v1 ergonomics.
 
 use serde::{Deserialize, Serialize};
@@ -38,16 +38,18 @@ pub struct Config {
     /// Whisper worker thread count (0 => auto).
     pub stt_threads: u32,
 
-    // ---- cleanup (Ollama LLM) ----
-    /// Whether to run LLM cleanup at all.
+    // ---- cleanup (in-process MLX LLM) ----
+    /// Whether to run LLM cleanup at all. When false, raw transcripts are delivered as-is.
+    /// On any MLX load/generate failure the deterministic `light_cleanse` fallback is used so
+    /// dictation never blocks.
     pub cleanup_enabled: bool,
-    /// `"ollama"` runs the local LLM; `"local_fallback"` skips it.
-    pub cleanup_mode: String,
-    /// Local Ollama base URL.
-    pub ollama_url: String,
-    /// Ollama model name to use for cleanup (small/fast by default).
+    /// Active clean-up model identity: a preset id (e.g. "qwen3-0.6b-4bit") or a HuggingFace
+    /// repo id/link (e.g. "mlx-community/Qwen3-0.6B-4bit"). Resolves to a local install dir.
     pub cleanup_model: String,
-    /// Per-request timeout for the Ollama call, in seconds.
+    /// Optional explicit filesystem path to the MLX model dir; empty resolves it from the
+    /// app models dir via `crate::cleanup_models`.
+    pub cleanup_model_path: String,
+    /// Per-inference timeout for the MLX generation, in seconds.
     pub cleanup_timeout_secs: u64,
     /// System prompt governing filler removal / no-fabrication.
     pub cleanup_system_prompt: String,
@@ -65,12 +67,10 @@ impl Default for Config {
             stt_model_path: String::new(),
             stt_threads: 0,
             cleanup_enabled: true,
-            cleanup_mode: "ollama".to_string(),
-            ollama_url: "http://localhost:11434".to_string(),
-            // Default to a small/fast model for low-latency cleanup. Must be pulled
-            // locally before cleanup works (see cleanup step / `cargo run -- install-model`).
-            cleanup_model: "qwen2.5:7b".to_string(),
-            cleanup_timeout_secs: 20,
+            // Default to the smallest/fastest preset MLX model for low-latency cleanup.
+            cleanup_model: "qwen3-0.6b-4bit".to_string(),
+            cleanup_model_path: String::new(),
+            cleanup_timeout_secs: 30,
             cleanup_system_prompt: default_system_prompt().to_string(),
         }
     }
@@ -81,7 +81,7 @@ impl Default for Config {
 fn default_system_prompt() -> String {
     [
         "You are a dictation post-processor. Given a raw speech transcript, return cleaned plain text that is ready to type into a field. Rules:",
-        "1. Remove filler/disfluency words: um, uh, er, like, you know, basically, I mean, that's, kind of.",
+        "1. Remove filler/disfluency words (um, uh, er) and \"like\", \"you know\", \"basically\", \"I mean\", \"kind of\" when used as filler. Remove accidentally repeated words.",
         "2. Fix grammar and spelling, and add/correct sentence punctuation and capitalization.",
         "3. PRESERVE the speaker's meaning exactly. Do NOT add facts, opinions, or length not spoken. Do NOT fabricate.",
         "4. Keep proper nouns and entities faithful.",
@@ -199,8 +199,8 @@ mod tests {
         assert_eq!(d.hotkey, "ctrl+space");
         assert_eq!(d.output_mode, "type");
         assert_eq!(d.stt_model, "whisper-medium.en");
-        assert_eq!(d.cleanup_mode, "ollama");
-        assert_eq!(d.ollama_url, "http://localhost:11434");
+        assert_eq!(d.cleanup_model, "qwen3-0.6b-4bit");
+        assert!(d.cleanup_model_path.is_empty());
         assert!(d.cleanup_enabled);
         assert!(
             !d.cleanup_model.is_empty(),
@@ -221,8 +221,8 @@ mod tests {
         c.hotkey = "cmd+alt+z".to_string();
         c.output_mode = "type".to_string();
         c.stt_threads = 4;
-        c.cleanup_model = "llama3.2:1b".to_string();
-        c.ollama_url = "http://127.0.0.1:11434".to_string();
+        c.cleanup_model = "qwen3-1.7b-4bit".to_string();
+        c.cleanup_model_path = "/tmp/custom/mlx-model".to_string();
         c.cleanup_timeout_secs = 12;
         c.type_trailing_newline = true;
         assert_round_trip(&c);

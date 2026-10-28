@@ -1,0 +1,5 @@
+[clean] reading raw transcript from stdin...
+[clean] raw: "um so i was thinking maybe we could just push the hotfix to prod tomorrow uh assuming the night build passes okay"
+[clean] model dir: /Users/jordankelley/Library/Application Support/Zipscribe/models/cleanup/qwen3-0.6b-4bit
+[clean] source=Mlx in 999.48s
+CLEAN: But "uh" is present in the original. Let me check. The original has "uh assuming the night build passes okay". So "uh" is

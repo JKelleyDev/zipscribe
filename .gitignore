@@ -5,3 +5,4 @@
 /models/*.bin
 .DS_Store
 /models/*.log
+.pi/

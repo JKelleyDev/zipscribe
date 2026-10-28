@@ -1,0 +1,754 @@
+//! Happy-path tests for indexing ops.
+
+use mlxrs::{Array, ops};
+
+#[test]
+fn take_flat_indices() {
+  // a = [10, 20, 30, 40, 50]; take indices [0, 2, 4] -> [10, 30, 50].
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[0, 2, 4], &[3i32]).unwrap();
+  let mut t = a.take(&idx).unwrap();
+  assert_eq!(t.shape(), vec![3]);
+  assert_eq!(t.to_vec::<f32>().unwrap(), vec![10.0, 30.0, 50.0]);
+}
+
+#[test]
+fn take_axis_picks_rows() {
+  // (3, 4) matrix; take_axis(axis=0, indices=[0, 2]) -> (2, 4) rows 0 & 2.
+  let data: Vec<f32> = (0..12).map(|x| x as f32).collect();
+  let a = Array::from_slice::<f32>(&data, &(3usize, 4)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0, 2], &[2i32]).unwrap();
+  let mut t = a.take_axis(&idx, 0).unwrap();
+  assert_eq!(t.shape(), vec![2, 4]);
+  // Row 0: [0,1,2,3]; row 2: [8,9,10,11].
+  assert_eq!(
+    t.to_vec::<f32>().unwrap(),
+    vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0]
+  );
+}
+
+#[test]
+fn take_along_axis_picks_per_row() {
+  // 2x3 input; pick a single column per row via a 2x1 indices array.
+  // a = [[1, 2, 3], [4, 5, 6]]; idx = [[2], [0]] -> [[3], [4]].
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let idx = Array::from_slice::<i32>(&[2, 0], &(2, 1)).unwrap();
+  let mut t = a.take_along_axis(&idx, 1).unwrap();
+  assert_eq!(t.shape(), vec![2, 1]);
+  assert_eq!(t.to_vec::<f32>().unwrap(), vec![3.0, 4.0]);
+}
+
+#[test]
+fn gather_single_axis_slice_sizes_one() {
+  // 1-D source; gather([1, 3]) along axis 0 with slice_sizes=[1] -> 1-element
+  // slices, output shape (2, 1).
+  let a = Array::from_slice::<f32>(&[100.0, 200.0, 300.0, 400.0, 500.0], &[5i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[1, 3], &[2i32]).unwrap();
+  let mut g = ops::indexing::gather(&a, &[&idx], &[0], &[1]).unwrap();
+  // Output shape: indices.shape ++ slice_sizes = [2] ++ [1] = [2, 1].
+  assert_eq!(g.shape(), vec![2, 1]);
+  assert_eq!(g.to_vec::<f32>().unwrap(), vec![200.0, 400.0]);
+}
+
+#[test]
+fn gather_rejects_empty_indices() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0], &[2i32]).unwrap();
+  let r = ops::indexing::gather(&a, &[], &[], &[1]);
+  // Production surfaces this guard as the typed `Error::EmptyInput` variant;
+  // assert the variant and that the payload's call-site context label is
+  // preserved in the rendered message.
+  match r {
+    Err(mlxrs::Error::EmptyInput(payload)) => {
+      assert_eq!(payload.context(), "gather: indices slice");
+    }
+    other => panic!("expected EmptyInput for empty indices, got {other:?}"),
+  }
+}
+
+#[test]
+fn gather_rejects_indices_axes_length_mismatch() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  // Only one indices array, but two axes -> rejected before FFI.
+  let r = ops::indexing::gather(&a, &[&idx], &[0, 1], &[1, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "gather: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+#[test]
+fn gather_rejects_negative_slice_size() {
+  // `slice_sizes` is a shape extent — negative values must be rejected before
+  // they can reach mlx::core::Shape construction.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let r = ops::indexing::gather(&a, &[&idx], &[0], &[-1]);
+  match r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert_eq!(p.context(), "shape::validate_dims: dim");
+      assert_eq!(p.requirement(), "must be non-negative");
+      assert_eq!(p.value(), "dim[0]=-1");
+    }
+    other => panic!("expected OutOfRange (shape::validate_dims), got {other:?}"),
+  }
+}
+
+#[test]
+fn gather_rejects_slice_sizes_rank_mismatch() {
+  // slice_sizes.len() must equal a.ndim().
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  // a.ndim() == 2 but slice_sizes is rank-1 -> rejected before FFI.
+  let r = ops::indexing::gather(&a, &[&idx], &[0], &[1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "gather: slice_sizes.len() vs a.ndim()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+#[test]
+fn put_along_axis_method_form() {
+  // Inverse of take_along_axis: scatter 9.0 into `a` at per-row column
+  // indices [[2],[0]] along axis 1 → [[1,2,9],[9,5,6]].
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let idx = Array::from_slice::<i32>(&[2, 0], &(2, 1)).unwrap();
+  let vals = Array::from_slice::<f32>(&[9.0, 9.0], &(2, 1)).unwrap();
+  let mut t = a.put_along_axis(&idx, &vals, 1).unwrap();
+  assert_eq!(t.shape(), vec![2, 3]);
+  assert_eq!(
+    t.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 9.0, 9.0, 5.0, 6.0]
+  );
+}
+
+#[test]
+fn scatter_overwrites_block() {
+  // The mlx `scatter` doc example #1 (verbatim): scatter the 1x2 row vector
+  // [1, 2] into a 4x4 zero matrix at axis-0 location 2. `updates` shape is
+  // indices.shape (=[1]) ++ a 1x2 block to write (=[1, 2]) -> [1, 1, 2].
+  let a = Array::from_slice::<f32>(&[0.0; 16], &(4, 4)).unwrap();
+  let idx = Array::from_slice::<i32>(&[2], &[1i32]).unwrap();
+  let updates = Array::from_slice::<f32>(&[1.0, 2.0], &[1i32, 1, 2]).unwrap();
+  let mut g = ops::indexing::scatter(&a, &[&idx], &updates, &[0]).unwrap();
+  assert_eq!(g.shape(), vec![4, 4]);
+  // Row 2 becomes [1, 2, 0, 0]; every other entry stays 0.
+  #[rustfmt::skip]
+  let expected = vec![
+    0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0,
+    1.0, 2.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0,
+  ];
+  assert_eq!(g.to_vec::<f32>().unwrap(), expected);
+}
+
+#[test]
+fn scatter_add_single_accumulates() {
+  // Single-axis convenience form. 1-D source [10,20,30,40,50]; add a scalar
+  // 100 at positions 1 and 3 (axis 0). `updates` shape is indices.shape (=[2])
+  // ++ a scalar block (=[1]) -> [2, 1]. Existing values are accumulated, so
+  // -> [10, 120, 30, 140, 50].
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[1, 3], &[2i32]).unwrap();
+  let updates = Array::from_slice::<f32>(&[100.0, 100.0], &[2i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_add_single(&a, &idx, &updates, 0).unwrap();
+  assert_eq!(r.shape(), vec![5]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![10.0, 120.0, 30.0, 140.0, 50.0]
+  );
+}
+
+#[test]
+fn slice_update_overwrites_region() {
+  // Overwrite the single element at [0:1, 1:2] of a 2x3 matrix with 99.
+  // a = [[1,2,3],[4,5,6]] -> [[1,99,3],[4,5,6]].
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[99.0], &(1, 1)).unwrap();
+  let mut r = a.slice_update(&upd, &[0, 1], &[1, 2], &[1, 1]).unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 99.0, 3.0, 4.0, 5.0, 6.0]
+  );
+}
+
+#[test]
+fn slice_update_add_accumulates_into_row() {
+  // Add [10,10,10] into row 1 (region [1:2, 0:3]) of a 2x3 matrix.
+  // a = [[1,2,3],[4,5,6]] -> [[1,2,3],[14,15,16]].
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[10.0, 10.0, 10.0], &(1, 3)).unwrap();
+  let mut r = a.slice_update_add(&upd, &[1, 0], &[2, 3], &[1, 1]).unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 14.0, 15.0, 16.0]
+  );
+}
+
+#[test]
+fn scatter_rejects_indices_axes_length_mismatch() {
+  // Mirror of gather_rejects_indices_axes_length_mismatch: one indices array
+  // but two axes -> rejected before FFI with a typed LengthMismatch.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1, 1]).unwrap();
+  let r = ops::indexing::scatter(&a, &[&idx], &upd, &[0, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "scatter: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+#[test]
+fn scatter_rejects_too_many_index_arrays() {
+  // core scatter caps indices.size() <= a.ndim(); the wrapper enforces it before
+  // building the index vector. `a` is 1-D (ndim 1) but two index arrays are
+  // passed (lengths match axes, so the equality check passes first).
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1]).unwrap();
+  let r = ops::indexing::scatter(&a, &[&idx, &idx], &upd, &[0, 0]);
+  match r {
+    Err(mlxrs::Error::CapExceeded(p)) => {
+      assert_eq!(p.context(), "scatter: number of index arrays");
+      assert_eq!(p.cap(), 1);
+      assert_eq!(p.observed(), 2);
+    }
+    other => panic!("expected CapExceeded for too many index arrays, got {other:?}"),
+  }
+}
+
+#[test]
+fn slice_update_rejects_zero_stride() {
+  // mlx normalize_slice divides by each stride, so a zero stride is division by
+  // zero; the wrapper rejects it with a typed error before the FFI call.
+  let src = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &[1i32, 1]).unwrap();
+  let r = ops::indexing::slice_update(&src, &upd, &[0, 0], &[1, 1], &[1, 0]);
+  match r {
+    Err(mlxrs::Error::OutOfRange(p)) => {
+      assert_eq!(p.context(), "slice-update: stride");
+      assert_eq!(p.value(), "0");
+    }
+    other => panic!("expected OutOfRange for zero stride, got {other:?}"),
+  }
+}
+
+#[test]
+fn slice_update_rejects_overflowing_stride() {
+  // mlx normalize_slice computes `axis_size + stride - 1` in int32, so a stride
+  // whose magnitude pushes that past i32::MAX overflows before the FFI returns.
+  // A normal negative stride (reverse slice) is fine; only out-of-range
+  // magnitudes are rejected. Covers i32::MIN (unrepresentable magnitude) and a
+  // large positive stride; both route through the same magnitude guard.
+  let src = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &[1i32, 1]).unwrap();
+  for bad in [i32::MIN, i32::MAX] {
+    match ops::indexing::slice_update(&src, &upd, &[0, 0], &[1, 1], &[1, bad]) {
+      Err(mlxrs::Error::OutOfRange(p)) => assert_eq!(p.context(), "slice-update: stride"),
+      other => panic!("expected OutOfRange for overflowing stride {bad}, got {other:?}"),
+    }
+  }
+}
+
+#[test]
+fn slice_update_rejects_i32_min_stride_on_empty_axis() {
+  // Regression: for a zero-length axis the magnitude bound
+  // `0 + abs(i32::MIN) - 1` equals i32::MAX exactly (not greater), so i32::MIN
+  // is NOT caught by the magnitude check — it must be rejected by the explicit
+  // negation guard, since mlx normalize_slice computes `-stride` (UB at INT_MIN)
+  // regardless of axis size.
+  let src = Array::from_slice::<f32>(&[], &[0i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[], &[0i32]).unwrap();
+  match ops::indexing::slice_update(&src, &upd, &[0], &[0], &[i32::MIN]) {
+    Err(mlxrs::Error::OutOfRange(p)) => assert_eq!(p.context(), "slice-update: stride"),
+    other => panic!("expected OutOfRange for i32::MIN stride on empty axis, got {other:?}"),
+  }
+}
+
+#[test]
+fn scatter_rejects_bool_index() {
+  // mlx core scatter throws an uncaught (non-std::exception) C++ exception for
+  // bool indices; the wrapper rejects them before FFI with a typed error on
+  // BOTH the multi-axis and single-axis paths.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1]).unwrap();
+  match ops::indexing::scatter(&a, &[&bool_idx], &upd, &[0]) {
+    Err(mlxrs::Error::InvariantViolation(p)) => assert_eq!(p.context(), "scatter: index dtype"),
+    other => panic!("expected InvariantViolation for bool index (multi), got {other:?}"),
+  }
+  match ops::indexing::scatter_axis(&a, &bool_idx, &upd, 0) {
+    Err(mlxrs::Error::InvariantViolation(p)) => assert_eq!(p.context(), "scatter: index dtype"),
+    other => panic!("expected InvariantViolation for bool index (single), got {other:?}"),
+  }
+}
+
+#[test]
+fn take_rejects_bool_index() {
+  // mlx routes `take`'s bool check through core `gather` (a std::exception that
+  // mlx-c WOULD catch); the binding still rejects it pre-FFI with a typed error
+  // for a uniform indexing-family contract — see `reject_bool_index`.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0], &[3i32]).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true], &[1i32]).unwrap();
+  match ops::indexing::take(&a, &bool_idx) {
+    Err(mlxrs::Error::InvariantViolation(p)) => assert_eq!(p.context(), "take: index dtype"),
+    other => panic!("expected InvariantViolation for bool index (take), got {other:?}"),
+  }
+}
+
+#[test]
+fn take_axis_rejects_bool_index() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true], &[1i32]).unwrap();
+  match ops::indexing::take_axis(&a, &bool_idx, 0) {
+    Err(mlxrs::Error::InvariantViolation(p)) => assert_eq!(p.context(), "take_axis: index dtype"),
+    other => panic!("expected InvariantViolation for bool index (take_axis), got {other:?}"),
+  }
+}
+
+#[test]
+fn take_along_axis_rejects_bool_index() {
+  // `take_along_axis` builds its `GatherAxis` primitive with NO op-build dtype
+  // check, so without this guard a Bool index reaches lazy eval; the binding
+  // rejects it pre-FFI with a typed error.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true, false], &(2, 1)).unwrap();
+  match ops::indexing::take_along_axis(&a, &bool_idx, 1) {
+    Err(mlxrs::Error::InvariantViolation(p)) => {
+      assert_eq!(p.context(), "take_along_axis: index dtype")
+    }
+    other => panic!("expected InvariantViolation for bool index (take_along_axis), got {other:?}"),
+  }
+}
+
+#[test]
+fn put_along_axis_rejects_bool_index() {
+  // `put_along_axis` builds its `ScatterAxis` primitive with NO op-build dtype
+  // check, so without this guard a Bool index reaches lazy eval.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true, false], &(2, 1)).unwrap();
+  let vals = Array::from_slice::<f32>(&[9.0, 9.0], &(2, 1)).unwrap();
+  match ops::indexing::put_along_axis(&a, &bool_idx, &vals, 1) {
+    Err(mlxrs::Error::InvariantViolation(p)) => {
+      assert_eq!(p.context(), "put_along_axis: index dtype")
+    }
+    other => panic!("expected InvariantViolation for bool index (put_along_axis), got {other:?}"),
+  }
+}
+
+#[test]
+fn scatter_add_axis_rejects_bool_index() {
+  // `scatter_add_axis` builds its `ScatterAxis` primitive with NO op-build dtype
+  // check, so without this guard a Bool index reaches lazy eval.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true, false], &(2, 1)).unwrap();
+  let vals = Array::from_slice::<f32>(&[9.0, 9.0], &(2, 1)).unwrap();
+  match ops::indexing::scatter_add_axis(&a, &bool_idx, &vals, 1) {
+    Err(mlxrs::Error::InvariantViolation(p)) => {
+      assert_eq!(p.context(), "scatter_add_axis: index dtype")
+    }
+    other => {
+      panic!("expected InvariantViolation for bool index (scatter_add_axis), got {other:?}")
+    }
+  }
+}
+
+#[test]
+fn gather_rejects_bool_index() {
+  // Core `gather` throws `std::invalid_argument` for bool indices (mlx-c WOULD
+  // catch it); the binding still guards it pre-FFI for a uniform typed error
+  // across the indexing family. The length/slice-size guards pass first so the
+  // bool guard is what fires.
+  let a = Array::from_slice::<f32>(&[100.0, 200.0, 300.0], &[3i32]).unwrap();
+  let bool_idx = Array::from_slice::<bool>(&[true], &[1i32]).unwrap();
+  match ops::indexing::gather(&a, &[&bool_idx], &[0], &[1]) {
+    Err(mlxrs::Error::InvariantViolation(p)) => assert_eq!(p.context(), "gather: index dtype"),
+    other => panic!("expected InvariantViolation for bool index (gather), got {other:?}"),
+  }
+}
+
+// ===========================================================================
+// Multi-axis scatter reduce family — `scatter_add` / `scatter_max` /
+// `scatter_min` / `scatter_prod`. Each delegates to `scatter_multi` with a
+// distinct reduce mode. All four use a 4-element 1-D source and a SINGLE
+// non-duplicate scatter location, so the result at that location is
+// unambiguously `reduce(existing, update)` (no duplicate-accumulation to
+// reason about) and every other element is unchanged. `updates` shape mirrors
+// `scatter_overwrites_block`: indices.shape (=[1]) ++ a per-location block
+// (=[1] scalar for a 1-D source) -> [1, 1].
+// ===========================================================================
+
+#[test]
+fn scatter_add_multi_axis_sums_at_location() {
+  // existing[2] = 30; scatter-add 5 at location 2 -> 35; others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[2], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[5.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_add(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![4]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 35.0, 40.0]);
+}
+
+#[test]
+fn scatter_max_multi_axis_keeps_larger() {
+  // location 1: max(20, 99) = 99 (update wins). location 3 left untouched so
+  // we also confirm a non-updated cell keeps its larger original.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[1], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[99.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_max(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![4]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 99.0, 30.0, 40.0]);
+}
+
+#[test]
+fn scatter_max_multi_axis_keeps_original_when_update_smaller() {
+  // location 1: max(20, 5) = 20 (existing wins); the reduce is a true max.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[1], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[5.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_max(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 30.0, 40.0]);
+}
+
+#[test]
+fn scatter_min_multi_axis_keeps_smaller() {
+  // location 2: min(30, 7) = 7 (update wins); others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[2], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[7.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_min(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![4]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 7.0, 40.0]);
+}
+
+#[test]
+fn scatter_prod_multi_axis_multiplies_at_location() {
+  // location 3: 40 * 2 = 80 (Prod reduce); others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[3], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[2.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_prod(&a, &[&idx], &upd, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![4]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 30.0, 80.0]);
+}
+
+// ===========================================================================
+// Multi-axis scatter reduce family — typed-error guards (no GPU needed). Each
+// public reduce wrapper threads its own `context` label through `scatter_multi`,
+// so cover the `indices.len() != axes.len()` LengthMismatch branch for each of
+// the four reduce variants (the equality guard runs before any FFI / index
+// vector allocation, so these stay pure validation paths).
+// ===========================================================================
+
+#[test]
+fn scatter_add_rejects_indices_axes_length_mismatch() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1, 1]).unwrap();
+  let r = ops::indexing::scatter_add(&a, &[&idx], &upd, &[0, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "scatter_add: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+#[test]
+fn scatter_max_rejects_indices_axes_length_mismatch() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1, 1]).unwrap();
+  let r = ops::indexing::scatter_max(&a, &[&idx], &upd, &[0, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "scatter_max: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+#[test]
+fn scatter_min_rejects_indices_axes_length_mismatch() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1, 1]).unwrap();
+  let r = ops::indexing::scatter_min(&a, &[&idx], &upd, &[0, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "scatter_min: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+#[test]
+fn scatter_prod_rejects_indices_axes_length_mismatch() {
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let idx = Array::from_slice::<i32>(&[0], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[9.0], &[1i32, 1, 1]).unwrap();
+  let r = ops::indexing::scatter_prod(&a, &[&idx], &upd, &[0, 1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "scatter_prod: indices.len() vs axes.len()"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch; got {r:?}"
+  );
+}
+
+// ===========================================================================
+// Single-axis scatter reduce family — `scatter_max_single` /
+// `scatter_min_single` / `scatter_prod_single` (mirrors `scatter_add_single`).
+// Each is a thin `scatter_single` dispatch with a distinct reduce mode. 1-D
+// source, single non-duplicate location, `updates` shape = indices.shape (=[1])
+// ++ scalar block (=[1]) -> [1].
+// ===========================================================================
+
+#[test]
+fn scatter_max_single_keeps_larger() {
+  // location 1: max(20, 99) = 99; others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[1], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[99.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_max_single(&a, &idx, &upd, 0).unwrap();
+  assert_eq!(r.shape(), vec![5]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![10.0, 99.0, 30.0, 40.0, 50.0]
+  );
+}
+
+#[test]
+fn scatter_min_single_keeps_smaller() {
+  // location 3: min(40, 4) = 4; others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[3], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[4.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_min_single(&a, &idx, &upd, 0).unwrap();
+  assert_eq!(r.shape(), vec![5]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![10.0, 20.0, 30.0, 4.0, 50.0]
+  );
+}
+
+#[test]
+fn scatter_prod_single_multiplies_at_location() {
+  // location 2: 30 * 3 = 90; others unchanged.
+  let a = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let idx = Array::from_slice::<i32>(&[2], &[1i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[3.0], &[1i32, 1]).unwrap();
+  let mut r = ops::indexing::scatter_prod_single(&a, &idx, &upd, 0).unwrap();
+  assert_eq!(r.shape(), vec![5]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![10.0, 20.0, 90.0, 40.0, 50.0]
+  );
+}
+
+// ===========================================================================
+// slice-update reduce family — `slice_update_max` / `slice_update_min` /
+// `slice_update_prod` (mirrors `slice_update` / `slice_update_add`). Each is a
+// thin `slice_update_impl` dispatch with a distinct reduce mode; exercise the
+// method-form bridge with an element-exact closed-form on a 2x3 matrix where a
+// single cell [0:1, 1:2] is the targeted region.
+// ===========================================================================
+
+#[test]
+fn slice_update_max_keeps_larger_in_region() {
+  // cell [0,1] = 2; max(2, 50) = 50 (update wins); everything else unchanged.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[50.0], &(1, 1)).unwrap();
+  let mut r = a.slice_update_max(&upd, &[0, 1], &[1, 2], &[1, 1]).unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 50.0, 3.0, 4.0, 5.0, 6.0]
+  );
+}
+
+#[test]
+fn slice_update_max_keeps_original_when_update_smaller() {
+  // cell [0,1] = 2; max(2, 0) = 2 (existing wins); confirms a true max, not an
+  // overwrite. The whole matrix is unchanged.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &(1, 1)).unwrap();
+  let mut r = a.slice_update_max(&upd, &[0, 1], &[1, 2], &[1, 1]).unwrap();
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+  );
+}
+
+#[test]
+fn slice_update_min_keeps_smaller_in_region() {
+  // cell [1,2] = 6; min(6, 1) = 1 (update wins); everything else unchanged.
+  // Region is [1:2, 2:3] (row 1, col 2).
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[1.0], &(1, 1)).unwrap();
+  let mut r = a.slice_update_min(&upd, &[1, 2], &[2, 3], &[1, 1]).unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 4.0, 5.0, 1.0]
+  );
+}
+
+#[test]
+fn slice_update_prod_multiplies_region() {
+  // cell [1,0] = 4; 4 * 10 = 40 (Prod reduce); everything else unchanged.
+  // Region is [1:2, 0:1] (row 1, col 0).
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[10.0], &(1, 1)).unwrap();
+  let mut r = a
+    .slice_update_prod(&upd, &[1, 0], &[2, 1], &[1, 1])
+    .unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 40.0, 5.0, 6.0]
+  );
+}
+
+// ===========================================================================
+// slice-update reduce family — typed-error guards through `slice_update_impl`.
+// The reduce variants each pass their own `context_multi` / `context_len`
+// labels, so cover BOTH length-guard branches (start/stop/strides unequal
+// lengths -> MultiLengthMismatch; equal-but-wrong-rank vs src.ndim() ->
+// LengthMismatch) for one representative reduce variant. These are pure
+// validation (no FFI), and the label assertions pin which wrapper is dispatching.
+// ===========================================================================
+
+#[test]
+fn slice_update_max_rejects_unequal_index_lengths() {
+  // start/stop/strides not all the same length -> MultiLengthMismatch before
+  // any rank or FFI check.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &(1, 1)).unwrap();
+  // start len 2, stop len 1, strides len 2.
+  let r = ops::indexing::slice_update_max(&a, &upd, &[0, 0], &[1], &[1, 1]);
+  match r {
+    Err(mlxrs::Error::MultiLengthMismatch(p)) => {
+      assert_eq!(p.context(), "slice_update_max: start/stop/strides");
+      assert_eq!(
+        p.lengths(),
+        &[("start", 2usize), ("stop", 1usize), ("strides", 2usize)]
+      );
+    }
+    other => panic!("expected MultiLengthMismatch (slice_update_max), got {other:?}"),
+  }
+}
+
+#[test]
+fn slice_update_min_rejects_rank_mismatch() {
+  // start/stop/strides all the same length (1) but != src.ndim() (2) ->
+  // LengthMismatch. This is the second guard branch in `slice_update_impl`,
+  // reached only after the equal-length check passes.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &(1, 1)).unwrap();
+  let r = ops::indexing::slice_update_min(&a, &upd, &[0], &[1], &[1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "slice_update_min: start/stop/strides length"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch (slice_update_min); got {r:?}"
+  );
+}
+
+#[test]
+fn slice_update_prod_rejects_rank_mismatch() {
+  // Same rank-mismatch branch via the prod variant, pinning its distinct
+  // `context_len` label.
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let upd = Array::from_slice::<f32>(&[0.0], &(1, 1)).unwrap();
+  let r = ops::indexing::slice_update_prod(&a, &upd, &[0], &[1], &[1]);
+  assert!(
+    matches!(
+      r,
+      Err(mlxrs::Error::LengthMismatch(ref p))
+        if p.context() == "slice_update_prod: start/stop/strides length"
+          && p.expected() == 2
+          && p.actual() == 1
+    ),
+    "expected LengthMismatch (slice_update_prod); got {r:?}"
+  );
+}
+
+// ===========================================================================
+// slice_update_dynamic — runtime data-dependent offset form. `start` is an
+// integer ARRAY of per-`axes` offsets; the placed region's extent matches
+// `update`'s shape (mlx `slice_update(src, update, start, axes)`). Use an
+// `update` whose ndim equals `src.ndim()` so the broadcast/min logic in mlx
+// `ops.cpp` is an identity, making the placement an exact overwrite.
+// ===========================================================================
+
+#[test]
+fn slice_update_dynamic_overwrites_at_runtime_offset() {
+  // 1-D src [10,20,30,40,50]; place [7,8] at runtime offset start=[2] along
+  // axis 0 -> overwrite positions 2,3 -> [10,20,7,8,50].
+  let src = Array::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5i32]).unwrap();
+  let upd = Array::from_slice::<f32>(&[7.0, 8.0], &[2i32]).unwrap();
+  let start = Array::from_slice::<i32>(&[2], &[1i32]).unwrap();
+  let mut r = ops::indexing::slice_update_dynamic(&src, &upd, &start, &[0]).unwrap();
+  assert_eq!(r.shape(), vec![5]);
+  assert_eq!(r.to_vec::<f32>().unwrap(), vec![10.0, 20.0, 7.0, 8.0, 50.0]);
+}
+
+#[test]
+fn slice_update_dynamic_method_form_2d() {
+  // 2x3 src; overwrite the 1x2 block at runtime offset (row 1, col 0) along
+  // axes [0, 1] with [[70, 80]] -> row 1 cols 0,1 become 70,80.
+  // a = [[1,2,3],[4,5,6]] -> [[1,2,3],[70,80,6]].
+  let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let upd = Array::from_slice::<f32>(&[70.0, 80.0], &(1, 2)).unwrap();
+  let start = Array::from_slice::<i32>(&[1, 0], &[2i32]).unwrap();
+  let mut r = a.slice_update_dynamic(&upd, &start, &[0, 1]).unwrap();
+  assert_eq!(r.shape(), vec![2, 3]);
+  assert_eq!(
+    r.to_vec::<f32>().unwrap(),
+    vec![1.0, 2.0, 3.0, 70.0, 80.0, 6.0]
+  );
+}

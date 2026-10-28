@@ -37,17 +37,29 @@
   <div class="card" id="models"></div>
   <div id="dlbox"></div>
 
-  <h2>Text clean-up (Ollama)</h2>
+  <h2>Text clean-up</h2>
   <div class="card">
-    <div class="row"><div class="label">Use AI clean-up<small id="ollama_state"></small></div>
+    <div class="row"><div class="label">Use AI clean-up<small id="cleanup_state"></small></div>
       <label class="switch"><input type="checkbox" id="cleanup"><span></span></label></div>
-    <div class="row"><div class="label">Model</div>
-      <select id="cmodel" class="w-sm"></select></div>
-    <div class="row"><div class="label">Ollama address</div>
-      <input type="url" id="url" class="w-sm"></div>
-    <div class="col"><div style="display:flex;justify-content:space-between;margin-bottom:6px">
-      <span>Instructions to the model</span><button class="link" id="resetprompt">Reset to default</button></div>
-      <textarea id="prompt"></textarea></div>
+  </div>
+  <div id="cmsection">
+    <p class="muted" style="margin:12px 0 8px">A small language model runs entirely on this Mac to remove filler
+      words and fix punctuation. Smaller is faster; bigger cleans up better.</p>
+    <div class="card" id="cmlist"></div>
+    <div id="cleanupdl"></div>
+    <div class="card" style="margin-top:12px">
+      <div class="col">
+        <div style="margin-bottom:6px">Add a model from HuggingFace
+          <small class="muted" style="display:block;font-size:12px">Paste a link or repo id for a Qwen3-based MLX model.</small></div>
+        <div class="inline-add">
+          <input type="text" id="hf_repo" placeholder="mlx-community/Qwen3-8B-4bit">
+          <button id="b_add">Add</button>
+        </div>
+      </div>
+      <div class="col"><div style="display:flex;justify-content:space-between;margin-bottom:6px">
+        <span>Instructions to the model</span><button class="link" id="resetprompt">Reset to default</button></div>
+        <textarea id="prompt"></textarea></div>
+    </div>
   </div>
 
   <h2>Permissions</h2>
@@ -66,9 +78,9 @@
 <div class="modal" id="umodal" hidden><div class="dialog">
   <h2 style="margin-top:0">Uninstall Zipscribe?</h2>
   <p class="muted">This quits Zipscribe, moves the app to the Trash, removes the start-at-login item and resets its microphone and Accessibility permissions.</p>
-  <label class="opt"><input type="checkbox" id="u_model" checked><div><b>Delete the downloaded speech model</b><small>Frees up to 1.5 GB</small></div></label>
+  <label class="opt"><input type="checkbox" id="u_model" checked><div><b>Delete the downloaded models</b><small>Speech + clean-up models</small></div></label>
   <label class="opt"><input type="checkbox" id="u_settings" checked><div><b>Delete my settings and log</b><small>Your hotkey and clean-up preferences</small></div></label>
-  <p class="muted" style="font-size:12px">Ollama and its models are separate and are not touched.</p>
+  <p class="muted" style="font-size:12px">Clean-up runs on-device; there is no separate external service to remove.</p>
   <div style="display:flex;justify-content:flex-end;gap:8px"><button id="u_cancel">Cancel</button><button class="danger" id="u_go">Uninstall</button></div>
 </div></div>
 </div>
@@ -77,10 +89,10 @@
 
 <script src="common.js"></script>
 <script>
-let cfg, models = [], ollamaModels = [], dl = null, dirty = false;
+let cfg, models = [], cleanupModels = [], dl = null, cleanupDl = null, dirty = false;
 
 const els = {};
-["enabled","hotkey","login","output_mode","newline","cleanup","cmodel","url","prompt","state","ollama_state"].forEach((k) => (els[k] = $("#" + k)));
+["enabled","hotkey","login","output_mode","newline","cleanup","prompt","state","cleanup_state"].forEach((k) => (els[k] = $("#" + k)));
 
 function markDirty() { dirty = true; $("#dirty").textContent = "Unsaved changes"; }
 
@@ -89,17 +101,52 @@ function fill() {
   els.output_mode.value = cfg.output_mode;
   els.newline.checked = cfg.type_trailing_newline;
   els.cleanup.checked = cfg.cleanup_enabled;
-  els.url.value = cfg.ollama_url;
   els.prompt.value = cfg.cleanup_system_prompt;
   fillModels();
   fillCleanupModels();
 }
 
+// The clean-up models: the presets plus any the user added from HuggingFace.
+async function refreshCleanupModels() {
+  cleanupModels = await invoke("cleanup_model_list");
+  fillCleanupModels();
+}
+
 function fillCleanupModels() {
-  const names = ollamaModels.slice();
-  if (!names.includes(cfg.cleanup_model)) names.unshift(cfg.cleanup_model);
-  els.cmodel.innerHTML = names.map((n) => `<option ${n === cfg.cleanup_model ? "selected" : ""}>${n}</option>`).join("");
-  els.ollama_state.textContent = ollamaModels.length ? "Ollama is running" : "Ollama not detected — text is only lightly tidied";
+  const on = els.cleanup.checked;
+  $("#cmsection").classList.toggle("hidden", !on);
+  $("#cmlist").innerHTML = cleanupModels.map((m) => `
+    <label class="opt">
+      <input type="radio" name="cm" value="${esc(m.id)}" ${m.id === cfg.cleanup_model ? "checked" : ""}>
+      <div class="grow"><b>${esc(m.label)}</b>
+        ${m.is_default ? `<span class="chip">Recommended</span>` : ""}
+        ${m.installed ? `<span class="chip ok">Installed</span>` : ""}
+        <small>${fmtMB(m.size_mb)}${m.custom ? " · added from HuggingFace" : ""}</small></div>
+      ${!m.installed ? `<button data-cinstall="${esc(m.id)}" ${cleanupDl ? "disabled" : ""}>Download</button>`
+        : m.custom ? `<button data-cremove="${esc(m.id)}" ${cleanupDl ? "disabled" : ""}>Remove</button>` : ""}
+    </label>`).join("");
+  $("#cmlist").querySelectorAll("input[name=cm]").forEach((r) =>
+    r.addEventListener("change", () => { cfg.cleanup_model = r.value; markDirty(); fillCleanupModels(); }));
+  $("#cmlist").querySelectorAll("[data-cinstall]").forEach((b) =>
+    b.addEventListener("click", (ev) => { ev.preventDefault(); installCleanup(b.dataset.cinstall); }));
+  $("#cmlist").querySelectorAll("[data-cremove]").forEach((b) =>
+    b.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      const m = cleanupModels.find((x) => x.id === b.dataset.cremove);
+      if (!confirm(`Remove ${m.label}? Its files will be deleted from this Mac.`)) return;
+      try {
+        await invoke("cleanup_remove", { id: m.id });
+        if (cfg.cleanup_model === m.id) {
+          cfg.cleanup_model = cleanupModels.find((x) => x.is_default).id;
+          markDirty();
+        }
+        await refreshCleanupModels();
+      } catch (e) { toast(String(e)); }
+    }));
+  const active = cleanupModels.find((m) => m.id === cfg.cleanup_model);
+  els.cleanup_state.textContent = !on ? "Off — text is lightly tidied without a model"
+    : active?.installed ? "Model ready on-device"
+    : "Selected model isn't downloaded yet — text will be only lightly tidied";
 }
 
 function fillModels() {
@@ -129,6 +176,27 @@ function showDl(err) {
   $("#cancel").addEventListener("click", () => invoke("cancel_download"));
 }
 
+function showCleanupDl(err) {
+  const box = $("#cleanupdl");
+  if (!cleanupDl) { box.innerHTML = err ? `<p class="err">${esc(err)}</p>` : ""; return; }
+  const pct = cleanupDl.total ? (100 * cleanupDl.done / cleanupDl.total).toFixed(1) : 0;
+  box.innerHTML = `<div class="bar"><div style="width:${pct}%"></div></div>
+    <div class="muted">Downloading ${esc(cleanupDl.id)}… ${fmtBytes(cleanupDl.done)} of ${fmtBytes(cleanupDl.total)} <button class="link" id="ccancel">Cancel</button></div>`;
+  $("#ccancel").addEventListener("click", () => invoke("cancel_download"));
+}
+
+// Start a preset download or a HuggingFace add. Input errors come back immediately; the rest
+// (unsupported model, network) arrive on the cleanup-done event.
+async function installCleanup(input) {
+  if (cleanupDl) { toast("A download is already running"); return; }
+  try {
+    const id = await invoke("cleanup_install", { repo: input });
+    cleanupDl = { id, done: 0, total: 0 };
+    showCleanupDl();
+    fillCleanupModels();
+  } catch (e) { showCleanupDl(String(e)); }
+}
+
 async function refreshPerms() {
   const p = await invoke("permissions");
   chip($("#p_mic"), p.microphone === "authorized" ? "Allowed" : p.microphone === "not_determined" ? "Not asked" : "Blocked", p.microphone === "authorized" ? "ok" : "bad");
@@ -138,17 +206,17 @@ async function refreshPerms() {
     : s.model_ready ? "Ready." : s.model_error ? "⚠ " + s.model_error : "Loading speech model…";
 }
 
-async function refreshOllama() {
-  try { ollamaModels = await invoke("ollama_models", { url: els.url.value }); } catch { ollamaModels = []; }
-  fillCleanupModels();
-}
-
 ["enabled","newline","cleanup"].forEach((k) => els[k].addEventListener("change", markDirty));
 els.output_mode.addEventListener("change", markDirty);
 els.prompt.addEventListener("input", markDirty);
-els.cmodel.addEventListener("change", markDirty);
-els.url.addEventListener("input", markDirty);
-els.url.addEventListener("change", refreshOllama);
+const addHf = () => {
+  const repo = $("#hf_repo").value.trim();
+  if (!repo) { toast("Paste a HuggingFace repo id or link first"); return; }
+  installCleanup(repo);
+};
+$("#b_add").addEventListener("click", addHf);
+$("#hf_repo").addEventListener("keydown", (e) => { if (e.key === "Enter") addHf(); });
+els.cleanup.addEventListener("change", fillCleanupModels);
 els.login.addEventListener("change", async () => {
   try { await invoke("set_login_item", { on: els.login.checked }); toast(els.login.checked ? "Will start at login" : "Won't start at login"); }
   catch (e) { toast(String(e)); els.login.checked = !els.login.checked; }
@@ -171,9 +239,8 @@ $("#save").addEventListener("click", async () => {
     output_mode: els.output_mode.value,
     type_trailing_newline: els.newline.checked,
     cleanup_enabled: els.cleanup.checked,
-    cleanup_mode: els.cleanup.checked ? "ollama" : "local_fallback",
-    cleanup_model: els.cmodel.value,
-    ollama_url: els.url.value.trim() || "http://localhost:11434",
+    cleanup_model: cfg.cleanup_model,
+    cleanup_model_path: cfg.cleanup_model_path || "",
     cleanup_system_prompt: els.prompt.value,
   };
   try { await invoke("save_config", { cfg: next }); cfg = next; dirty = false; $("#dirty").textContent = ""; toast("Saved"); refreshPerms(); }
@@ -187,6 +254,21 @@ listen("download-done", async (e) => {
   showDl(e.payload.error && e.payload.error !== "cancelled" ? e.payload.error : null);
   fillModels();
 });
+// Clean-up model download (presets and arbitrary HF repos) shares the cancel flag with the
+// whisper download, but reports on its own events so the two UI panels stay independent.
+listen("cleanup-progress", (e) => { cleanupDl = e.payload; showCleanupDl(); });
+listen("cleanup-done", async (e) => {
+  const id = cleanupDl?.id;
+  cleanupDl = null;
+  const err = e.payload.error && e.payload.error !== "cancelled" ? e.payload.error : null;
+  showCleanupDl(err);
+  if (!err && !e.payload.error && id) {
+    $("#hf_repo").value = "";
+    if (cfg.cleanup_model !== id) { cfg.cleanup_model = id; markDirty(); toast("Model ready — click Save to use it"); }
+    else toast("Clean-up model ready");
+  }
+  await refreshCleanupModels();
+});
 
 (async () => {
   cfg = await invoke("get_config");
@@ -194,9 +276,8 @@ listen("download-done", async (e) => {
   els.login.checked = await invoke("login_item_enabled");
   $("#logpath").textContent = await invoke("log_path");
   const hk = hotkeyRecorder(els.hotkey, cfg.hotkey, (v) => { cfg.hotkey = v; markDirty(); });
+  await refreshCleanupModels();
   fill();
-  // The hotkey is applied on Save, so a bad combo can't strand the user.
-  refreshOllama();
   refreshPerms();
   setInterval(refreshPerms, 2000);
 })();

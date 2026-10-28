@@ -1,19 +1,21 @@
-//! LLM cleanup of raw transcripts via a local Ollama model.
+//! Clean-up of raw transcripts via an in-process Apple MLX model.
 //!
-//! The raw whisper transcript (full of "um/uh/like") is POSTed to a configurable local Ollama
-//! model over `http://localhost:11434`.  The LLM removes fillers, fixes grammar/punctuation, and
-//! preserves meaning without fabricating content.  **On any Ollama failure the cleaner falls back
-//! to a deterministic local "light cleanse" (filler strip + light punctuation) rather than
-//! blocking** — dictation must never hang because the LLM is down.
-
-use reqwest::blocking::Client;
-use serde_json::json;
-use std::time::Duration;
+//! The raw whisper transcript (full of "um/uh/like") is fed to a small LLM that runs **in the
+//! zipscribe process** on Apple Silicon via MLX (`crate::mlx`) — no external service or daemon.
+//! The LLM removes fillers, fixes grammar/punctuation, and preserves meaning without fabricating
+//! content.
+//!
+//! **No-block guarantee:** on any MLX load/generate failure (model missing/broken, out of memory,
+//! empty output, …) the cleaner falls back to the deterministic local `light_cleanse` (filler
+//! strip + light punctuation) rather than blocking — dictation must never hang because the model
+//! is unavailable.
 
 /// Where the cleansed text came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanSource {
-    Ollama,
+    /// Produced by the in-process MLX model.
+    Mlx,
+    /// Produced by the deterministic `light_cleanse` fallback.
     Fallback,
 }
 
@@ -23,150 +25,121 @@ pub struct CleanResult {
     pub source: CleanSource,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum CleanError {
-    #[error("ollama request failed: {0}")]
-    Request(#[from] reqwest::Error),
-    #[error("unexpected ollama response: {0}")]
-    Response(String),
-}
-
-/// A configurable, Ollama-backed cleaner with a local fallback.
+/// Carries the timeout for the no-block path. The resident `crate::mlx::MlxModel` handle is
+/// owned by the clean-up thread in `crate::service` and passed on demand.
 pub struct Cleaner {
-    ollama_url: String,
-    model: String,
-    client: Client,
+    /// Per-inference timeout, seconds.
+    pub timeout_secs: u64,
 }
-
-const SYSTEM_PROMPT: &str = "You convert raw dictation into clean, ready-to-type prose for a dictation app.\n\
-Remove ALL hesitation and filler words — um, uh, er, eh, hmm, like, so, so basically, you know, I mean,\n\
-I think, I was thinking, basically, essentially, actually, kind of, sort of, that is to say, well, okay,\n\
-alright — and remove stuttered or repeated words (\"the the\" -> \"the\", \"and and\" -> \"and\").\n\
-Fix capitalization, punctuation, and basic grammar, and add a single period at the end.\n\
-Preserve every spoken CONTENT word and proper noun exactly — do NOT add facts, opinions,\n\
-examples, or words that were not spoken, do NOT fabricate anything, and do NOT substitute,\n\
-correct, or \"fix\" a word that looks like a mishearing (e.g. leave \"crime\" as-is even if\n\
-\"client\" was meant): your job is to remove fillers and fix grammar/punctuation/capitalization\n\
-ONLY - correcting transcribed content is not your job. Do the cleaning silently and output ONLY\n\
-the result: plain text, one line, no markdown, no bold/asterisks, no quotation marks, no \"here\n\
-is\", no explanation, no bullet list, no leading \"so\" or \"the answer is\". Just the cleaned\n\
-sentence(s) and nothing else.";
 
 impl Cleaner {
-    pub fn new(ollama_url: impl Into<String>, model: impl Into<String>) -> Self {
-        Self {
-            ollama_url: ollama_url.into().trim_end_matches('/').to_string(),
-            model: model.into(),
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("build reqwest client"),
+    pub fn new() -> Self {
+        Self { timeout_secs: 30 }
+    }
+
+    pub fn with_timeout(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
+    }
+
+    /// Deterministic no-LLM fallback used when cleanup is disabled or MLX is unavailable.
+    pub fn fallback_clean(&self, raw: &str) -> CleanResult {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return CleanResult {
+                text: String::new(),
+                source: CleanSource::Fallback,
+            };
+        }
+        CleanResult {
+            text: light_cleanse(raw),
+            source: CleanSource::Fallback,
         }
     }
 
-    /// Cleanse `raw`.  Tries Ollama; on any error returns the local light-cleansed fallback so
-    /// the dictation pipeline never blocks.
-    pub fn clean(&self, raw: &str) -> Result<CleanResult, CleanError> {
+    /// MLX clean-up of `raw` via the resident `model_handle`. On any failure or empty output it
+    /// returns `fallback_clean`, so the pipeline never blocks and never swallows the dictation.
+    pub fn clean_mlx(
+        &self,
+        model_handle: &crate::mlx::MlxModel,
+        system_prompt: &str,
+        raw: &str,
+    ) -> CleanResult {
         let raw = raw.trim();
         if raw.is_empty() {
-            return Ok(CleanResult {
+            return CleanResult {
                 text: String::new(),
                 source: CleanSource::Fallback,
-            });
+            };
         }
-        let prompt = format!("Raw dictation transcript:\n{}\n\nReturn ONLY the cleaned prose (one line):", raw);
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                { "role": "system", "content": SYSTEM_PROMPT },
-                { "role": "user", "content": prompt }
-            ],
-            "stream": false,
-            "think": false,
-            // Some reasoning models (qwen3) reason inline; we extract the final answer after the\n            // cap num_predict so a short one-line output can't run away.
-            "options": { "temperature": 0.0, "num_ctx": 4096, "num_predict": 256 }
-        });
-
-        match self.call_ollama(&body) {
-            Ok(text) => {
-                let cleaned = normalize_spaces(&scrub_markdown(&extract_after_thinking(text.trim())));
+        let deadline = std::time::Duration::from_secs(self.timeout_secs.max(1));
+        // Pure disfluencies are removed up front so a small model only has to fix grammar, and
+        // its output gets the same deterministic finish (capitals, "I", end punctuation).
+        let pre = strip_fillers(raw);
+        match model_handle.generate(system_prompt, &pre, 256, deadline) {
+            Ok(out) => {
+                let cleaned = finish_sentence(&strip_fillers(&normalize_spaces(&scrub_markdown(
+                    &extract_after_thinking(out.trim()),
+                ))));
                 // A model that returns nothing must never swallow the user's dictation.
                 if cleaned.trim().is_empty() {
-                    log::warn!("[cleanup] model returned empty output; using local fallback");
-                    Ok(CleanResult {
-                        text: light_cleanse(raw),
-                        source: CleanSource::Fallback,
-                    })
+                    log::warn!("[cleanup] mlx returned empty output; using light_cleanse fallback");
+                    self.fallback_clean(raw)
                 } else {
-                    Ok(CleanResult {
+                    log::info!("[cleanup] mlx source -> {cleaned:?}");
+                    CleanResult {
                         text: cleaned,
-                        source: CleanSource::Ollama,
-                    })
+                        source: CleanSource::Mlx,
+                    }
                 }
             }
             Err(e) => {
-                log::warn!("[cleanup] ollama unavailable ({e}); using local fallback");
-                Ok(CleanResult {
-                    text: light_cleanse(raw),
-                    source: CleanSource::Fallback,
-                })
+                log::warn!("[cleanup] mlx unavailable ({e}); using light_cleanse fallback");
+                self.fallback_clean(raw)
             }
         }
-    }
-
-    /// POST to Ollama's native chat endpoint and parse `message.content`.
-    fn call_ollama(&self, body: &serde_json::Value) -> Result<String, CleanError> {
-        let url = format!("{}/api/chat", self.ollama_url);
-        let resp = self.client.post(&url).json(body).send()?;
-        if !resp.status().is_success() {
-            return Err(CleanError::Response(format!(
-                "HTTP {} from {}",
-                resp.status(),
-                &url
-            )));
-        }
-        let parsed: serde_json::Value = resp.json()?;
-        // Ollama native response shape: { "message": { "content": "..." } }
-        let content = parsed.pointer("/message/content").and_then(|v| v.as_str()).ok_or_else(
-            || CleanError::Response(format!("no /message/content in response: {parsed}")),
-        )?;
-        Ok(content.to_string())
-    }
-
-    /// Whether the configured Ollama endpoint is reachable (used by the tray to show status).
-    #[allow(dead_code)]
-    pub fn ollama_reachable(&self) -> bool {
-        self.client
-            .get(format!("{}/api/tags", self.ollama_url))
-            .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
     }
 }
 
 /// Deterministic local fallback: strip common fillers, collapse whitespace, capitalize, and
 /// ensure a trailing period.  No LLM, never blocks, faithful (doesn't invent content).
 pub fn light_cleanse(raw: &str) -> String {
-    // Single-word fillers (case-insensitive).  "you know" is caught by dropping "know" after "you".
-    const FILLERS: [&str; 16] = [
-        "um", "uh", "er", "hmm", "hmmm", "like", "basically", "essentially", "actually",
-        "literally", "okay", "ok", "well", "right", "so", "but",
-    ];
+    finish_sentence(&strip_fillers(raw))
+}
+
+/// Drop pure disfluencies (case-insensitive). Words like "like", "so" or "but" carry meaning
+/// too often to drop without a language model, so they are left alone.
+fn strip_fillers(raw: &str) -> String {
+    const FILLERS: [&str; 8] = ["um", "umm", "uh", "uhh", "er", "erm", "hmm", "hmmm"];
     let mut out: Vec<String> = Vec::new();
-    let mut last_lower = String::new();
     for tok in raw.split_whitespace() {
-        let bare = strip_punct(tok);
-        let lower = bare.to_lowercase();
-        let is_single = FILLERS.iter().any(|f| f == &lower);
-        let is_two = bare == "know" && last_lower == "you";
-        if is_single || is_two {
+        let lower = strip_punct(tok).to_lowercase();
+        if FILLERS.iter().any(|f| f == &lower) {
+            continue;
+        }
+        // "you know" mid-sentence: drop both words, not just "know".
+        if lower == "know" && out.last().is_some_and(|p| strip_punct(p).eq_ignore_ascii_case("you")) {
+            out.pop();
             continue;
         }
         out.push(tok.to_string());
-        last_lower = lower;
     }
-    let mut s = out.join(" ").trim().to_string();
-    s = capitalize_first(&s);
+    out.join(" ").trim().to_string()
+}
+
+/// Capitalize each sentence start and the pronoun "I" (incl. I'm/I'll/I've/I'd), and end with
+/// terminal punctuation.
+fn finish_sentence(s: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut sentence_start = true;
+    for tok in s.split_whitespace() {
+        let bare = strip_punct(tok).to_lowercase();
+        let is_i = bare == "i" || bare.starts_with("i'") || bare.starts_with("i\u{2019}");
+        let t = if sentence_start || is_i { capitalize_first(tok) } else { tok.to_string() };
+        sentence_start = t.ends_with(['.', '!', '?']);
+        out.push(t);
+    }
+    let mut s = out.join(" ");
     if !s.is_empty() && !s.ends_with(['.', '!', '?', ':']) {
         s.push('.');
     }
@@ -208,38 +181,34 @@ fn capitalize_first(s: &str) -> String {
 }
 
 /// Collapse runs of whitespace/tabs/newlines to single spaces.
-fn normalize_spaces(s: &str) -> String {
+pub fn normalize_spaces(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Extract the final answer from a model that reasons inline (e.g. qwen3), even when think is left
-/// on and the whole response (reasoning + answer) lands in the content field. The answer is whatever
-/// follows the last closing think block. A dangling open tag (truncated reasoning) yields empty so
-/// the caller falls back to light_cleanse. Deterministic; never invents content.
-fn extract_after_thinking(s: &str) -> String {
-    // qwen3 (via Ollama 0.40) reasons as PLAIN TEXT and settles on its answer as the LAST
-    // substantive line; some variants keep reasoning in a separate `thinking` field (already
-    // absent from `content`). So take the last content line, skipping markdown/bullet/commentary.
-    // For a non-reasoning response this is effectively the whole (single-line) text.
-    let lines: Vec<&str> = s
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && is_content_line(l))
-        .collect();
-    match lines.last() {
-        Some(l) => l.to_string(),
-        None => s.trim().to_string(),
+/// Drop any inline reasoning block from the model output. Text after the last closing think
+/// tag is the answer; a dangling open tag (truncated reasoning) yields empty so the caller
+/// falls back to `light_cleanse`. Output with no think tags is returned unchanged.
+pub fn extract_after_thinking(s: &str) -> String {
+    if let Some(i) = s.rfind("</think>") {
+        return s[i + "</think>".len()..].trim().to_string();
     }
+    if s.contains("<think>") {
+        return String::new();
+    }
+    s.trim().to_string()
 }
 
 /// Defensive guard for LLM output that, even after the strong "output ONLY plain text" instruction,
 /// sometimes carries a stray line of commentary, markdown markers, or surrounding quotes. Conservative
 /// and deterministic: it strips wrappers but never invents content. With qwen3 thinking ON the
 /// `content` field is already clean, so this is a safety net, not the main cleaning step.
-fn scrub_markdown(s: &str) -> String {
+pub fn scrub_markdown(s: &str) -> String {
     let t = s.trim();
-    // 1. Take the first substantive content line (skip headings/bullets/"here is"-style lines).
-    let line = t.lines().map(str::trim).find(|l| is_content_line(l)).unwrap_or(t).trim();
+    // 1. Keep every substantive content line (skip headings/bullets/"here is"-style lines) so a
+    //    multi-sentence answer split across lines is not truncated.
+    let kept: Vec<&str> = t.lines().map(str::trim).filter(|l| is_content_line(l)).collect();
+    let joined = kept.join(" ");
+    let line = if kept.is_empty() { t } else { joined.as_str() };
     // 2. Strip markdown emphasis markers into an owned string, then a surrounding quote pair.
     let cleaned_str: String = line.replace("**", "").replace('*', "").replace('`', "");
     let s = cleaned_str.trim();
@@ -252,7 +221,8 @@ fn scrub_markdown(s: &str) -> String {
 }
 
 /// A line counts as content if it's non-empty and not obvious commentary/heading/bullet markup.
-fn is_content_line(l: &str) -> bool {    if l.is_empty() {
+fn is_content_line(l: &str) -> bool {
+    if l.is_empty() {
         return false;
     }
     let lower = l.to_lowercase();
@@ -261,7 +231,6 @@ fn is_content_line(l: &str) -> bool {    if l.is_empty() {
         && !l.starts_with("* ")
         && !lower.starts_with("here is")
         && !lower.starts_with("here's")
-        && !lower.starts_with("the clean")
         && !lower.contains("why this")
 }
 
@@ -277,6 +246,7 @@ mod tests {
         assert_eq!(scrub_markdown("Here is the cleaned text:\nWe should reschedule."), "We should reschedule.");
     }
 
+    #[test]
     fn normalize_collapses_whitespace() {
         assert_eq!(normalize_spaces("a\nb\t  c\n\nd"), "a b c d");
     }
@@ -285,11 +255,32 @@ mod tests {
     fn light_cleanse_strips_fillers() {
         let out = light_cleanse("um so i think we should um like go to the store and get some milk");
         assert!(!out.to_lowercase().contains(" um "), "fillers remain: {out}");
-        assert!(!out.to_lowercase().contains("like "), "fillers remain: {out}");
         assert!(out.ends_with('.'), "no trailing period: {out}");
         assert!(out.chars().next().map_or(false, |c| c.is_uppercase()), "not capitalized: {out}");
         assert!(out.contains("go"), "meaning lost: {out}");
         assert!(out.contains("milk"), "meaning lost: {out}");
+    }
+
+    #[test]
+    fn finish_sentence_capitalizes_sentences_and_pronoun_i() {
+        assert_eq!(
+            finish_sentence("i think so. i'm sure it works? yes i do"),
+            "I think so. I'm sure it works? Yes I do."
+        );
+        assert_eq!(finish_sentence("in it"), "In it.");
+    }
+
+    #[test]
+    fn light_cleanse_drops_you_know_and_keeps_meaningful_words() {
+        let out = light_cleanse("move it to friday you know but i like the plan");
+        assert_eq!(out, "Move it to friday but I like the plan.");
+    }
+
+    #[test]
+    fn extract_strips_think_blocks_and_keeps_multiline_answers() {
+        assert_eq!(extract_after_thinking("<think>\n\n</think>\n\nHello there."), "Hello there.");
+        assert_eq!(extract_after_thinking("<think>still reasoning"), "");
+        assert_eq!(scrub_markdown("First sentence.\nSecond sentence."), "First sentence. Second sentence.");
     }
 
     #[test]

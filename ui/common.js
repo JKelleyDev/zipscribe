@@ -74,3 +74,4 @@ function hotkeyRecorder(el, initial, onChange) {
 
 const fmtMB = (mb) => (mb >= 1000 ? (mb / 1000).toFixed(1) + " GB" : mb + " MB");
 const fmtBytes = (b) => fmtMB(Math.round(b / 1e6));
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));

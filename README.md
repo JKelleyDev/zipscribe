@@ -6,18 +6,19 @@ your Mac.
 
 - **Speech-to-text**: OpenAI Whisper (`whisper.cpp`, Metal GPU accelerated), run inside the app and
   kept loaded so repeat dictations are fast.
-- **Clean-up (optional)**: a local [Ollama](https://ollama.com) model removes "um"s, fixes grammar
-  and punctuation, and keeps your meaning without inventing anything. If Ollama isn't running, you
-  still get a lightly tidied transcript.
+- **Clean-up (optional)**: a small language model, running **in-process via Apple MLX** and kept
+  resident, removes "um"s, fixes grammar and punctuation, and keeps your meaning without inventing
+  anything. If no clean-up model is installed (or inference fails), you still get a lightly
+  tidied transcript — dictation is never blocked.
 - **Output**: types into the focused window (default), or copies to the clipboard and pastes.
 - **Menu bar**: a 🎙 icon with an on/off toggle and Settings. It shows 🔴 while listening and ⏳
   while working.
 
 ## Requirements
 
-- A Mac with Apple Silicon (M1 or later) running macOS 12 or newer
+- A Mac with Apple Silicon (M1 or later) running macOS 14 (Sonoma) or newer
 - About 150 MB – 1.6 GB of disk for the speech model (you choose the size during setup)
-- *Optional:* [Ollama](https://ollama.com), if you want AI clean-up
+- *Optional:* a clean-up language model — pick and download a size in the app (on-device, Apple MLX)
 
 ## Install
 
@@ -45,19 +46,22 @@ The guide walks through six steps:
 
 Change anything later from **🎙 → Settings…**.
 
-### Optional: AI clean-up with Ollama
+### Optional: AI clean-up (on-device, in-process)
 
-1. Install Ollama from [ollama.com](https://ollama.com) and make sure it's running.
-2. Pull the default model:
+A small language model runs inside Zipscribe via Apple MLX — no separate server and no internet
+call at runtime. In the **Text clean-up** setup step pick a size and download it once:
 
-   ```sh
-   ollama pull qwen2.5:7b
-   ```
+- **Small (0.6B)** — fast, a little less polished. *The default.*
+- **Medium (1.7B)** — more accurate clean-up, a bit slower.
+- **Large (4B)** — the most accurate, the slowest to load.
 
-   (A smaller model such as `qwen2.5:1.5b` is faster but less polished; choose it in
-   Settings → Text clean-up.)
+You can also use your own model, either during setup (**Use your own model**) or in **Settings →
+Text clean-up → Add a model from HuggingFace**: paste a repo id or link (e.g.
+`mlx-community/Qwen3-8B-4bit`) and it is downloaded into your model folder with progress and cancel.
+The model must be a **Qwen3-based MLX** model; other architectures are rejected before anything is
+downloaded. Models you add can be removed again from Settings.
 
-Skipping this is fine — Zipscribe falls back to simple clean-up automatically.
+Skipping this is fine — Zipscribe falls back to a simple, deterministic clean-up automatically.
 
 ## Using it
 
@@ -73,7 +77,7 @@ the clean-up model, edit the clean-up instructions, and turn on **Start at login
 | Nothing is typed, but no error | Accessibility isn't granted. System Settings → Privacy & Security → Accessibility → turn Zipscribe on. |
 | Permissions look granted but don't work after updating | The app is ad-hoc signed, so macOS ties permissions to the exact build. In Privacy & Security, **remove** the old Zipscribe entry (the `−` button) from Accessibility and Microphone, then re-add or re-grant it. |
 | Microphone step won't turn green | Quit and reopen Zipscribe. If it's still stuck, check System Settings → Privacy & Security → Microphone. |
-| Text isn't being cleaned up | Open Settings → Text clean-up. If it says *Ollama not detected*, start Ollama and confirm the model name matches one from `ollama list`. |
+| Text isn't being cleaned up | Open Settings → Text clean-up and download a model (the smallest is enough); the active model shows *ready on-device* once installed. If it still isn't cleaning, check the log. |
 | "No speech model is loaded" | Finish the *Speech model* download in Settings. |
 | Something else | Check the log at `~/Library/Logs/Zipscribe/zipscribe.log`. |
 
@@ -92,8 +96,8 @@ Open **🎙 → Settings… → Help → Uninstall…**. Zipscribe quits, moves 
 the start-at-login item, and resets its microphone and Accessibility permissions. Two checkboxes
 let you keep the downloaded speech model (up to 1.5 GB) or your settings if you plan to reinstall.
 
-Ollama and its models are separate and are never touched; remove them with `ollama rm <model>` if
-you want.
+There is no separate clean-up service to remove — the model lives in your model folder and is
+taken out by the *Delete the downloaded models* checkbox above, or by deleting that folder.
 
 <details>
 <summary>Uninstall by hand</summary>
@@ -111,16 +115,19 @@ tccutil reset All com.jordankelley.zipscribe
 
 ## Build from source
 
-You need Apple Silicon, Xcode Command Line Tools (`xcode-select --install`), CMake
-(`brew install cmake`), [Rust](https://rustup.rs) (the pinned toolchain installs itself via
+You need Apple Silicon, **full Xcode** (from the App Store) with its Metal toolchain
+(`xcodebuild -downloadComponent MetalToolchain`), CMake (`brew install cmake`), [Rust](https://rustup.rs) (the pinned toolchain installs itself via
 `rust-toolchain.toml`), and Node.js (only for the Tauri CLI).
 
 ```sh
 git clone https://github.com/JKelleyDev/zipscribe.git && cd zipscribe
 npm install
-npx tauri build              # -> src-tauri/target/release/bundle/macos/Zipscribe.app
-./scripts/make-dmg.sh        # -> src-tauri/target/release/bundle/Zipscribe.dmg
+ZIPSCRIBE_MLX_METAL=ON ./scripts/make-dmg.sh   # builds the app, then -> src-tauri/target/release/bundle/Zipscribe.dmg
 ```
+
+`ZIPSCRIBE_MLX_METAL=ON` builds the clean-up model's MLX backend for the GPU. Without it (or
+without full Xcode) MLX is CPU-only, which is far too slow for clean-up: every dictation then waits
+the full `cleanup_timeout_secs` and types the simple fallback clean-up instead.
 
 The first build compiles whisper.cpp and takes several minutes; later builds are quick. Then open
 the DMG and follow **Install** above.
@@ -145,8 +152,10 @@ The binary also has subcommands, run as
 | `record-secs <n>` | Record `n` seconds from the mic to a WAV |
 | `p2t` | Log each hotkey press and release |
 | `transcribe <file.wav>...` | Transcribe audio files |
-| `clean <text> [model]` | Clean text via Ollama (falls back on failure) |
-| `clean-fallback <text>` | Force the no-Ollama path |
+| `clean [model] <text…>` | Clean text via the in-process MLX model (falls back on failure; `model` is a dir, preset id, or HF repo) |
+| `clean-fallback "" <text>` | Force the deterministic no-LLM clean-up path |
+
+Set `ZIPSCRIBE_MLX_DEBUG=1` when running `clean` to print the exact prompt and raw model output.
 | `perms` | Report Microphone and Accessibility status |
 | `type-demo [text]` | Demonstrate typed output |
 | `install` / `uninstall` | Add or remove the login item |
@@ -156,7 +165,7 @@ The binary also has subcommands, run as
 ```
 hold hotkey  ──>  16 kHz mono mic capture
 release      ──>  Whisper (resident in memory)      ──>  raw transcript
-                  Ollama model (or simple fallback) ──>  cleaned prose
+                  MLX model (or simple fallback) ──>  cleaned prose
                   key simulation (or ⌘V paste)      ──>  typed into the focused window
 ```
 

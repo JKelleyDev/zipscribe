@@ -2,11 +2,12 @@
 
 > Local, on-device, macOS dictation app in Rust. On Push-to-Talk, transcribe held
 > audio with in-process `openai/whisper-medium.en` (via whisper-rs / whisper.cpp),
-> clean it with a configurable local Ollama LLM, and type the cleansed text into the
+> clean it with a configurable **in-process Apple MLX** LLM (a small language model loaded
+> and run inside the binary, no external daemon), and type the cleansed text into the
 > currently focused window. Runs at startup as a LaunchAgent.
 >
 > **Note on research:** At spec time, live web research against the Zipscribe repo
-> was unavailable (`ollama signin` required for web tools). This spec is derived from
+> was unavailable (web-research tools were restricted then). This spec is derived from
 > the well-known Zipscribe design pattern plus the user's confirmed v1 choices, and
 > is the source of truth for implementation. Cross-checking against the live repo is a
 > v2 task if desired.
@@ -20,14 +21,14 @@
 - Activation: **Push-to-Talk (P2T)** only — hold a hotkey to record, release to process.
 - STT engine: `openai/whisper-medium.en` loaded **in-process** via `whisper-rs`
   (whisper.cpp bindings), kept resident.
-- Cleanup: a single configurable **local Ollama** LLM (`http://localhost:11434`),
-  default = a small/quick model; user can switch the model.
+- Cleanup: a single configurable **in-process Apple MLX** LLM, defaulting to the smallest
+  preset; the user can switch the model or add any Qwen3-based MLX model from Hugging Face.
 - Output: **type** the cleansed text into the currently focused, non-app window via
   key simulation.
 - UI: a macOS **menu-bar / tray** indicator with enable/disable toggle + config access.
 - Startup: register as a **LaunchAgent / Login Item** that starts on login.
-- **Fully local / on-device.** Nothing leaves the machine except the local Ollama
-  HTTP call to `localhost`.
+- **Fully local / on-device.** Nothing leaves the machine: STT and clean-up both run
+  in-process on this Mac (Whisper + MLX).
 
 ### Out of scope (v2 — do NOT start)
 - Continuous voice-activity/silence auto-mode.
@@ -56,7 +57,7 @@
  P2T key ──▶│  2. Transcribe│──► raw transcript (Whisper)
  (release)  └──────────────┘
             ┌──────────────┐
-            │  3. Clean     │──► cleansed text (Ollama LLM, or local fallback)
+            │  3. Clean     │──► cleansed text (in-process MLX LLM, or local fallback)
             └──────────────┘
             ┌──────────────┐
             │  4. Type      │──► input injected into the focused window
@@ -83,10 +84,12 @@
 - If transcription fails or yields empty/whitespace: do **not** type anything,
   log a warning, and return to idle. Never type a blank line.
 
-### 2.3 Clean (Ollama LLM)
-- POST the raw transcript to the local Ollama generate endpoint
-  (`http://localhost:11434/api/generate` or `/api/chat`) using the **configured model
-  name** (default: a small/fast model; user can switch it).
+### 2.3 Clean (in-process MLX LLM)
+- Load the configured MLX-format model (safetensors + tokenizer) **in-process** via the
+  `mlx-rs` binding and generate the cleaned transcript there — no external daemon and no
+  network at generation time. The model is a small/medium language model (default: the
+  smallest preset; the user can switch, or add an MLX-format model from Hugging Face by
+  repo id or link). It is loaded **once and kept resident** so repeat dictations stay fast.
 - **Cleanup rules the prompt must enforce:**
   1. Remove filler / disfluency words ("um", "uh", "like", "you know", "actually",
      "basically", repeated self-corrections, trailing "and...").
@@ -99,10 +102,10 @@
      only.
   7. Trim surrounding whitespace; do not add a trailing newline unless the user
      clearly ended a sentence that warrants it (configurable later).
-- **Graceful fallback:** if Ollama is down / times out / errors, fall back to a
-  lightweight **local** cleanup (filler-word strip + minimal punctuation/
-  capitalization, no fabrication) and type that, rather than blocking or typing raw
-  "um/uh" speech. Log that fallback was used.
+- **Graceful fallback (no-block guarantee):** if MLX inference fails, is unavailable, or
+  times out, fall back to a lightweight **local** cleanup (filler-word strip + minimal
+  punctuation/ capitalization, no fabrication) and type that, rather than blocking or
+  typing raw "um/uh" speech. Log that fallback was used.
 - **Special commands (v1 minimal, optional):** recognize phrases like "insert time",
   "insert date", "new line", "stop dictation" as literal command expansions rather
   than transcribed text. Keep minimal and documented.
@@ -158,10 +161,9 @@ threads = 8                    # whisper worker threads
 
 [cleanup]
 enabled = true
-mode = "ollama"                # "ollama" | "local_fallback"
-ollama_url = "http://localhost:11434"
-model = "<small/fast-model>"   # configurable; default set at install
-timeout_secs = 20
+model = "qwen3-0.6b-4bit"      # preset id, installed path, or HF repo; default = smallest preset
+model_path = ""                # optional explicit override to a downloaded .mlx dir
+timeout_secs = 30
 system_prompt = "..."          # the filler-removal / no-fabrication prompt
 
 [permissions]
@@ -184,7 +186,9 @@ zipscribe/
     capture.rs           # microphone capture via cpal (step 3)
     hotkey.rs            # global P2T detection (step 3)
     transcribe.rs        # whisper-rs wrapper, resident model
-    cleanup.rs           # Ollama client + local fallback
+    cleanup.rs           # in-process MLX clean-up client + local fallback
+    cleanup_models.rs    # clean-up model catalog (presets) + HF-repo download
+    mlx.rs               # mlx-rs binding: load + generate the resident MLX model
     output.rs            # key-sim typing + permission checks
     tray.rs              # menu-bar UI + enable/disable + config access
     launch.rs            # LaunchAgent install/uninstall helpers
@@ -199,7 +203,7 @@ zipscribe/
 - Global hotkey: `global-hotkey` (or `enigo`/`cocoa` for raw key events).
 - Key simulation (typing into focused app): `enigo` and/or CoreGraphics `CGEvent`.
 - Whisper: `whisper-rs` (whisper.cpp). Need `whisper-medium.en` GGML model file.
-- HTTP (Ollama): `reqwest` (blocking on a worker thread is fine for v1).
+- In-process LLM: `mlx-rs` (Apple MLX via Rust) for clean-up; no HTTP call at runtime.
 - Config: `serde` + `toml` + `dirs`/`dirs-next`.
 - Tray / menu bar (lightweight, no heavy GUI framework): `tao` + `tray-icon`
   (or `tao`'s menu-bar). Avoid Tauri/tao-with-webview to keep the binary small.
@@ -212,7 +216,7 @@ zipscribe/
 - [ ] P2T: hold hotkey → record mic → release → cleansed text types into the
       previously focused window with "um/uh" removed (demo in a text editor).
 - [ ] STT is `whisper-medium.en`, loaded in-process + resident; raw transcript verified.
-- [ ] Cleanup via configurable Ollama model; graceful local fallback when Ollama down.
+- [ ] Cleanup via configurable in-process MLX model; graceful local fallback when MLX unavailable.
 - [ ] Tray indicator with enable/disable + config.
 - [ ] LaunchAgent auto-starts on login (verified via `launchctl list`).
 - [ ] Mic + Accessibility detected/guided; no crash when missing.

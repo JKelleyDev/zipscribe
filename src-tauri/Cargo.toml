@@ -1,6 +1,6 @@
 [package]
 name = "zipscribe"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [build-dependencies]
@@ -23,3 +23,15 @@ whisper-rs = { version = "0.16.0", features = ["metal"] }
 tauri-plugin-single-instance = "2"
 block2 = "0.6"
 objc2 = "0.6"
+
+# In-process, on-device LLM clean-up via Apple MLX, through the native Rust `mlx-rs` binding
+# (no Ollama, no external daemon). We patch mlxrs + mlxrs-sys to the vendored, source-controlled
+# copies under `mlx-vendor/` which default to a CPU build (`MLX_BUILD_METAL=OFF`) so the project
+# compiles on a machine with only the Xcode Command Line Tools; Metal activates on a full-Xcode
+# host via `ZIPSCRIBE_MLX_METAL=ON`, which release builds require (CPU-only is far too slow).
+# `mlxrs` itself is unchanged upstream; only its `mlxrs-sys` build defaults to CPU here.
+mlxrs = { version = "0.2", features = ["lm", "qwen3", "tokenizer-chat"] }
+
+[patch.crates-io]
+mlxrs = { path = "mlx-vendor/mlxrs" }
+mlxrs-sys = { path = "mlx-vendor/mlxrs-sys" }

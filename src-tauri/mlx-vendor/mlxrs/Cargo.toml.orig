@@ -1,0 +1,179 @@
+[package]
+name = "mlxrs"
+version = "0.2.0"
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/mlxrs"
+description = "Safe Rust bindings for Apple's MLX array framework, with LM, VLM, audio, and embeddings support"
+keywords = ["mlx", "apple-silicon", "machine-learning", "metal", "llm"]
+categories = ["science", "api-bindings", "external-ffi-bindings", "mathematics"]
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# `serde_json` is an explicit feature (not a bare `dep:serde_json`) so a
+# `#[cfg(feature = "serde_json")]` gate is accurate wherever the dep is
+# pulled — used by the always-compiled `io::load_weights_from_dir` to gate
+# its `model.safetensors.index.json` (JSON) discovery tier without forcing
+# JSON onto the `serde_json`-free `embeddings` feature. Every feature that
+# needs JSON parsing depends on `"serde_json"` (the feature), which enables
+# `dep:serde_json` **and** `dep:serde`: `load_via_index` deserializes the
+# index `weight_map` through a typed `serde::Deserialize` visitor (so it can
+# reject a duplicate tensor→shard binding, which `serde_json::Value` would
+# silently collapse), and that visitor needs the `serde` derive/trait crate
+# present wherever the `serde_json` index tier compiles.
+serde_json           = ["dep:serde_json", "dep:serde"]
+tokenizer            = ["dep:tokenizers"]                                          # HfTokenizer load + encode/decode + special tokens from tokenizer.json. NO serde_json/minijinja.
+tokenizer-config     = ["tokenizer", "serde_json"]                                 # parse tokenizer_config.json → bos/eos/unk/chat_template/added-tokens
+tokenizer-stream     = ["tokenizer"]                                              # StreamingDetokenizer trait + NaiveStreamingDetokenizer (no serde_json)
+tokenizer-gpt2       = []                                                          # GPT-2 bytes↔unicode table (committed cargo-xtask-codegen artifact)
+tokenizer-bpe        = ["tokenizer-stream", "tokenizer-gpt2", "serde_json"]        # GPT-2 byte-level streaming detok + decoder-class inference
+tokenizer-spm        = ["tokenizer-stream", "serde_json"]                          # SentencePiece (+no-space) streaming detok + decoder-class inference
+tokenizer-chat       = ["tokenizer-config", "dep:minijinja", "dep:minijinja-contrib", "dep:serde", "dep:jiff"]   # jinja apply_chat_template (jiff: strftime_now)
+tokenizer-deepseek-v32 = ["tokenizer-chat"]                                        # the one shipped chat-template override
+tokenizer-tools      = ["tokenizer-config", "serde_json"]                          # tool-call parsers + infer_tool_parser
+
+embeddings           = ["tokenizer", "dep:memspan", "dep:glob"]
+lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools", "dep:regex"]
+llguidance           = ["lm", "dep:llguidance", "dep:toktrie_hf_tokenizers", "serde_json"]
+vlm                  = ["lm", "dep:image"]
+lfm2-vl              = ["vlm"]                                                     # LFM2 hybrid conv+attention LM + the LFM2.5-VL vision-language wrapper over it
+qwen3                = ["lm", "dep:serde", "serde_json"]                           # Qwen3 dense text transformer (GQA + per-head Q/K-norm + SwiGLU): config + forward + tied head
+audio                = ["lm", "dep:symphonia", "dep:cpal", "dep:unicode-normalization", "dep:xattr"]
+wav2vec2             = ["audio", "dep:serde", "serde_json"]                        # wav2vec2 CTC speech model (facebook/wav2vec2-base-960h): config + sanitize + char vocab.json
+siglip2-naflex       = ["embeddings", "vlm", "dep:serde", "serde_json"]            # SigLIP2 NaFlex dual-tower embeddings (google/siglip2-base-patch16-naflex): config + NaFlex preprocessing (reuses vlm::resize NEON)
+whisper              = ["audio", "tokenizer-bpe", "dep:flate2"]                    # OpenAI Whisper STT (audio front-end + GPT-2 byte-level BPE tokenizer; flate2 for the decode compression-ratio heuristic)
+qwen3-asr            = ["qwen3", "audio", "dep:serde", "serde_json"]               # Qwen3-ASR audio encoder (Conv2d stem + transformer encoder): config + sanitize + forward
+qwen3-asr-aligner    = ["qwen3-asr", "tokenizer", "dep:unicode-general-category"]  # Qwen3 forced aligner (timestamp-classification head over the decoder); the RawTranscript ForcedAligner path owns word-splitting + tokenization via the model Tokenizer (unicode-general-category: exact General_Category for the clean_token keep-predicate)
+sensevoice           = ["audio", "tokenizer-spm", "dep:serde", "serde_json"]       # SenseVoice-Small CTC STT (mlx-community/SenseVoiceSmall): Kaldi-fbank+LFR+CMVN front-end, SANM/FSMN encoder, CTC head + rich-info (language/emotion/event); SentencePiece via tokenizer-spm
+vad                  = ["audio", "dep:serde", "serde_json"]                        # Silero VAD (snakers4/silero-vad): per-rate STFT-conv + 4 conv blocks + LSTM + sigmoid speech-prob head, fixed 512/256-sample chunking at 16k/8k, streaming context, speech-segment post-processing (threshold + min-speech/min-silence + speech-pad)
+embeddinggemma       = ["embeddings", "lm", "dep:serde", "serde_json"]             # EmbeddingGemma sentence-encoder (google/embeddinggemma-300m): Gemma3 bidirectional backbone + mean pooling + Dense projection head
+clap                 = ["embeddings", "audio", "npz", "dep:serde", "serde_json"]   # CLAP-HTSAT-unfused dual-tower audio+text embeddings (laion/clap-htsat-unfused): config + Slaney mel front-end (reuses audio::dsp), HTSAT Swin + RoBERTa towers; npz for the .npy oracle fixtures
+unstable-ops-overload = []
+gguf                 = []
+npz                  = ["dep:zip", "dep:memmapix"]                                # NumPy .npy (single array) + .npz (ZIP of <name>.npy members); mirrors mx.save/savez/savez_compressed (stored + deflate). memmapix memory-maps the file on load (peak ~3x→~1x)
+
+[dependencies]
+mlxrs-sys.workspace = true
+thiserror.workspace = true
+half.workspace = true
+smallvec.workspace = true
+smol_str = "0.3"
+static_assertions.workspace = true
+ctor.workspace = true
+derive_more.workspace = true
+libc = "0.2" # SIGABRT diagnostics handler (diagnostics.rs)
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+minijinja = { version = "2", features = ["loader", "json", "loop_controls", "builtins", "preserve_order"], optional = true }
+minijinja-contrib = { version = "2", features = ["pycompat"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true, features = ["preserve_order"] }
+memspan = { version = "0.1", optional = true }
+glob = { version = "0.3", optional = true }
+jiff = { version = "0.2", optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+symphonia = { version = "0.6", optional = true, default-features = false, features = [
+  "wav",
+  "pcm",
+  "mp3",
+  "flac",
+  "ogg",
+  "vorbis",
+] }
+cpal = { version = "0.18", optional = true }
+flate2 = { version = "1", optional = true } # zlib DEFLATE for the Whisper decode compression-ratio fallback heuristic
+unicode-normalization = { version = "0.1", optional = true }
+unicode-general-category = { version = "1", optional = true }
+regex = { version = "1", optional = true, default-features = false, features = ["std", "perf"] }
+llguidance = { version = "1.7", optional = true, default-features = false, features = ["lark", "referencing"] }
+toktrie_hf_tokenizers = { version = "1.7", optional = true }
+zip = { version = "8", optional = true, default-features = false, features = ["deflate"] } # NumPy .npz ZIP read/write (stored + DEFLATE members) for the `npz` feature
+memmapix = { version = "0.9", optional = true } # memory-map .npy / .npz files on load (peak load memory ~3x→~1x); memmap2-compatible API
+
+[target.'cfg(unix)'.dependencies]
+xattr = { version = "1", optional = true }
+
+# CoreML / Neural-Engine Whisper backend (Apple Silicon only). Pure objc2-core-ml
+# (no Objective-C shim): drives the compiled WhisperKit `.mlmodelc` MelSpectrogram
+# / AudioEncoder / TextDecoder models on the ANE. Platform-gated (not a cargo
+# feature) and selected at load time by the checkpoint shape, like the lfm/embedder
+# on-device backends. objc2 0.3.x framework crates over the objc2 0.6.x core; all
+# CoreML classes live behind per-class cargo features that are ON by default.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+  "NSArray",
+  "NSDictionary",
+  "NSString",
+  "NSValue",     # NSNumber
+  "NSError",
+  "NSURL",
+] }
+objc2-core-ml = "0.3"
+
+[dev-dependencies]
+approx.workspace = true
+trybuild.workspace = true
+criterion = "0.8"
+libc = "0.2" # SIGABRT child-process test (tests/diagnostics.rs)
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "aarch64-apple-darwin"
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "arithmetic"
+harness = false
+
+[[bench]]
+name = "reduction"
+harness = false
+
+[[bench]]
+name = "shape"
+harness = false
+
+[[bench]]
+name = "linalg"
+harness = false
+
+[[bench]]
+name = "simd_pad_canvas_fill"
+harness = false
+required-features = ["vlm"]
+
+[[bench]]
+name = "simd_bgr_widen"
+harness = false
+required-features = ["vlm"]
+
+[[bench]]
+name = "simd_quantize"
+harness = false
+required-features = ["audio"]
+
+[[bench]]
+name = "simd_rgb_widen"
+harness = false
+required-features = ["vlm"]
+
+[[bench]]
+name = "simd_siglip_normalize"
+harness = false
+required-features = ["vlm"]
+
+[[bench]]
+name = "simd_pcm_decode"
+harness = false
+required-features = ["audio"]
+
+[[bench]]
+name = "simd_lfilter"
+harness = false
+required-features = ["audio"]

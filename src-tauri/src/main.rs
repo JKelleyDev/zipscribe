@@ -1,14 +1,14 @@
 //! zipscribe — local, on-device macOS dictation app.
 //!
 //! Pipeline: Push-to-Talk → capture mic → transcribe (whisper-medium.en, in-process)
-//! → clean (local Ollama LLM) → type cleansed text into the focused window.
+//! → clean (in-process MLX LLM) → type cleansed text into the focused window.
 //!
 //! This module is the skeleton entry point. Modules are implemented in later steps:
 //!   config   — schema + load/save  (step 2 / scaffold-config)
 //!   capture  — microphone capture via cpal (step 3 / stt-capture)
 //!   hotkey   — global Push-to-Talk detection (step 3 / stt-hotkey)
 //!   transcribe — whisper-rs wrapper, resident model (step 3 / stt-whisper)
-//!   cleanup  — Ollama client + local fallback (step 4 / cleanup)
+//!   cleanup  — in-process MLX clean-up + local fallback (step 4 / cleanup)
 //!   output   — key-sim typing + permission checks (step 5 / output)
 //!   app      — Tauri menu-bar app, setup + settings windows
 //!   service  — dictation worker loop
@@ -24,6 +24,8 @@ mod models;
 mod service;
 mod stt;
 mod cleanup;
+mod mlx;
+mod cleanup_models;
 
 use std::process::ExitCode;
 
@@ -98,13 +100,21 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("clean") => match run_clean(args.get(2).map(|s| s.as_str()), args.get(3).map(|s| s.as_str()), "http://localhost:11434") {
+        Some("clean") => match run_clean(args.get(2).map(|s| s.as_str()), args.get(3).map(|s| s.as_str())) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => { eprintln!("clean failed: {e}"); ExitCode::FAILURE }
         },
-        Some("clean-fallback") => match run_clean(args.get(2).map(|s| s.as_str()), args.get(3).map(|s| s.as_str()), "http://127.0.0.1:99999") {
+        Some("clean-fallback") => match run_clean(Some(FORCE_FALLBACK), args.get(3).map(|s| s.as_str())) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => { eprintln!("clean-fallback failed: {e}"); ExitCode::FAILURE }
+        },
+        Some("clean-mlx") => match run_clean_mlx(args.get(2).map(|s| s.as_str()), args.get(3).map(|s| s.as_str())) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => { eprintln!("clean-mlx failed: {e}"); ExitCode::FAILURE }
+        },
+        Some("install-cleanup") => match run_install_cleanup(args.get(2).map(|s| s.as_str())) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => { eprintln!("install-cleanup failed: {e}"); ExitCode::FAILURE }
         },
         Some("perms") => match run_perms() {
             Ok(()) => ExitCode::SUCCESS,
@@ -198,14 +208,24 @@ fn run_transcribe(files: &[std::string::String]) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Cleanse a raw transcript with a local Ollama model (or fall back locally).  Prints the raw and
+/// Cleanse a raw transcript with a local MLX model (or fall back locally).  Prints the raw and
 /// cleansed text side by side.  Usage: `clean [raw-text] [model]` or `clean-fallback`.
+/// Clean-up a raw transcript. Usage: `clean [model-dir] [raw-text]` (raw falls back to stdin).
+///
+/// Resolves the on-disk MLX model dir from the `model-dir` arg, else `config` (`cleanup_model`
+/// / `cleanup_model_path` via `cleanup_models::resolve_model_dir`), loads it IN-PROCESS, and
+/// cleans via the LLM.  On any load failure or absent/failed model it returns `light_cleanse`
+/// (`source=Fallback`) so the command never hangs.  This is a one-shot diagnostic; the live
+/// dictation pipeline enforces the no-block guarantee by falling back on failure.
+/// Sentinel model arg used by `clean-fallback` to skip MLX entirely.
+const FORCE_FALLBACK: &str = "\0fallback";
+
 fn run_clean(
-    raw_arg: Option<&str>,
     model_arg: Option<&str>,
-    ollama_url: &str,
+    raw_arg: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = env_logger::try_init();
+    use std::time::Instant;
     let cfg = config::Config::load().unwrap_or_default();
     // Raw transcript: from arg, else read a line from stdin.
     let raw = match raw_arg {
@@ -217,15 +237,137 @@ fn run_clean(
             s.trim().to_string()
         }
     };
-    let model = model_arg
-        .unwrap_or(cfg.cleanup_model.as_str());
+    let cleaner =
+        cleanup::Cleaner::new()
+            .with_timeout(cfg.cleanup_timeout_secs);
     eprintln!("[clean] raw: {raw:?}");
-    eprintln!("[clean] ollama_url={ollama_url} model={model}");
-    let cleaner = cleanup::Cleaner::new(ollama_url.to_string(), model.to_string());
+
+    if raw.trim().is_empty() {
+        println!("CLEAN:");
+        return Ok(());
+    }
+
+    // Resolve the model dir: explicit arg path, else config resolution.
+    let dir: Option<std::path::PathBuf> = match model_arg.filter(|d| !d.trim().is_empty()) {
+        Some(FORCE_FALLBACK) => None,
+        Some(d) => Some(std::path::PathBuf::from(d)),
+        None => crate::cleanup_models::resolve_model_dir(
+            &cfg.cleanup_model,
+            &cfg.cleanup_model_path,
+        ),
+    };
+    // Same path as live dictation: the model lives on the clean-up thread and the caller waits
+    // at most `cleanup_timeout_secs` before falling back.
+    eprintln!("[clean] model dir: {}", dir.as_ref().map(|d| d.display().to_string()).unwrap_or("(none)".into()));
+    let worker = service::CleanupWorker::spawn();
+    worker.load(dir);
+    worker.wait_idle();
+    let t0 = Instant::now();
+    let r = worker.clean(&cleaner, &cfg.cleanup_system_prompt, &raw);
+    eprintln!("[clean] source={:?} in {:.2}s", r.source, t0.elapsed().as_secs_f32());
+    println!("CLEAN: {}", r.text);
+    Ok(())
+}
+
+/// Download a clean-up MLX model into the app models dir.  Usage:
+/// `install-cleanup [id-or-hf-repo]` (e.g. `qwen3-0.6b-4bit` or a pasted HF link).
+/// Without an arg, installs the default (smallest) preset.  Mirrors the whisper download
+/// flow (progress + cancel).
+fn run_install_cleanup(id_or_repo: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = env_logger::try_init();
+    use crate::cleanup_models;
+    use std::sync::atomic::AtomicBool;
+
+    let input = id_or_repo.unwrap_or(cleanup_models::default_model().repo_id);
+    // Preset by id? Else treat as an arbitrary HF repo id/link.
+    let (local_id, repo_id) = if cleanup_models::is_preset_id(input) {
+        let m = cleanup_models::CLEANUP_MODELS
+            .iter()
+            .find(|m| m.id == input)
+            .unwrap();
+        (m.id.to_string(), m.repo_id.to_string())
+    } else {
+        let repo = cleanup_models::parse_repo(input)?;
+        (cleanup_models::sanitize_id(&repo), repo)
+    };
+    eprintln!("[install-cleanup] repo={repo_id} local_id={local_id}");
+    let cancel = AtomicBool::new(false);
     let t0 = std::time::Instant::now();
-    let res = cleaner.clean(&raw)?;
-    eprintln!("[clean] source={:?} in {:.2}s", res.source, t0.elapsed().as_secs_f32());
-    println!("CLEAN: {}", res.text);
+    let mut last = std::time::Instant::now();
+    let res = cleanup_models::download_from_repo(&local_id, &repo_id, &cancel, |done, total| {
+        if last.elapsed().as_millis() > 250 {
+            let pct = if total > 0 { done as f64 / total as f64 * 100.0 } else { 0.0 };
+            eprintln!("[install-cleanup] {done}/{total} bytes ({pct:.1}%)");
+            last = std::time::Instant::now();
+        }
+    });
+    match res {
+        Ok(dir) => {
+            eprintln!("[install-cleanup] done in {:.2}s -> {}", t0.elapsed().as_secs_f32(), dir.display());
+            println!("INSTALLED: {}", dir.display());
+            Ok(())
+        }
+        Err(e) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))),
+    }
+}
+
+/// In-process MLX clean-up of a raw transcript.  Usage:
+/// `clean-mlx <model-dir> [raw-text]`.  Proves the LLM runs in-process (no daemon).
+/// On load/generate failure it prints the deterministic `light_cleanse` fallback so the
+/// command never hangs.
+fn run_clean_mlx(
+    model_dir_arg: Option<&str>,
+    raw_arg: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::path::Path;
+    let _ = env_logger::try_init();
+    let cfg = config::Config::load_or_default();
+    let raw = match raw_arg {
+        Some(s) => s.to_string(),
+        None => {
+            eprintln!("[clean-mlx] reading raw transcript from stdin...");
+            let mut s = String::new();
+            std::io::stdin().read_line(&mut s)?;
+            s.trim().to_string()
+        }
+    };
+    // Model dir: explicit arg, else fall back locally (no model configured yet).
+    let model_dir = match model_dir_arg {
+        Some(p) => p.to_string(),
+        None => {
+            eprintln!("[clean-mlx] no model-dir arg; cannot load MLX, using light_cleanse");
+            eprintln!("[clean-mlx] source=FALLBACK");
+            println!("CLEAN: {}", crate::cleanup::light_cleanse(&raw));
+            return Ok(());
+        }
+    };
+    eprintln!("[clean-mlx] model_dir={model_dir} raw={raw:?}");
+    let t0 = std::time::Instant::now();
+    match mlx::load_model(Path::new(&model_dir)) {
+        Ok(model) => {
+            let max_tokens = 48;
+            let deadline = std::time::Duration::from_secs(cfg.cleanup_timeout_secs.max(1));
+            match model.generate(&cfg.cleanup_system_prompt, &raw, max_tokens, deadline) {
+                Ok(out) => {
+                    let cleaned = crate::cleanup::normalize_spaces(
+                        &crate::cleanup::scrub_markdown(&crate::cleanup::extract_after_thinking(out.trim())),
+                    );
+                    eprintln!("[clean-mlx] source=MLX in {:.2}s", t0.elapsed().as_secs_f32());
+                    println!("CLEAN: {cleaned}");
+                }
+                Err(e) => {
+                    eprintln!("[clean-mlx] generate failed ({e}); using light_cleanse fallback");
+                    eprintln!("[clean-mlx] source=FALLBACK");
+                    println!("CLEAN: {}", crate::cleanup::light_cleanse(&raw));
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[clean-mlx] load failed ({e}); using light_cleanse fallback");
+            eprintln!("[clean-mlx] source=FALLBACK");
+            println!("CLEAN: {}", crate::cleanup::light_cleanse(&raw));
+        }
+    }
     Ok(())
 }
 

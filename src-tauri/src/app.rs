@@ -203,16 +203,14 @@ fn open_system_settings(pane: String) {
 /// installed from HuggingFace — not from an external service.)
 
 #[tauri::command]
-fn model_list() -> Vec<ModelEntry> {
-    crate::models::MODELS
-        .iter()
-        .map(|m| ModelEntry {
-            id: m.id,
-            label: m.label,
-            size_mb: m.size_mb,
-            installed: crate::models::is_installed(m.id),
-        })
-        .collect()
+fn speech_model() -> ModelEntry {
+    let m = &crate::models::MODEL;
+    ModelEntry {
+        id: m.id,
+        label: m.label,
+        size_mb: m.size_mb,
+        installed: crate::models::is_installed(),
+    }
 }
 
 #[tauri::command]
@@ -239,7 +237,7 @@ struct DownloadResult {
 }
 
 #[tauri::command]
-fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+fn download_model(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     if state.downloading.swap(true, Ordering::SeqCst) {
         return Err("a download is already running".into());
     }
@@ -247,8 +245,9 @@ fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
     let cancel = state.download_cancel.clone();
     std::thread::spawn(move || {
         let progress_app = app.clone();
+        let id = crate::models::MODEL.id.to_string();
         let progress_id = id.clone();
-        let result = crate::models::download(&id, &cancel, move |done, total| {
+        let result = crate::models::download(&cancel, move |done, total| {
             let _ = progress_app.emit(
                 "download-progress",
                 DownloadProgress { id: progress_id.clone(), done, total },
@@ -489,7 +488,7 @@ pub fn run() -> ExitCode {
             request_microphone,
             request_accessibility,
             open_system_settings,
-            model_list,
+            speech_model,
             cleanup_model_list,
             cleanup_install,
             cleanup_remove,
@@ -589,6 +588,12 @@ pub fn run() -> ExitCode {
 
             if !cfg.setup_complete {
                 open_setup(app.handle());
+            } else if !crate::models::is_installed() && std::env::var_os("WF_MODEL").is_none()
+                && cfg.stt_model_path.is_empty()
+            {
+                // Upgrading from a version with a different speech model: show Settings so the
+                // user can download the new one right away.
+                open_settings(app.handle());
             }
             Ok(())
         })

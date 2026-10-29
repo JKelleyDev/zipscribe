@@ -1,4 +1,7 @@
-//! Whisper model files: where they live, which ones we offer, and downloading them.
+//! The Whisper model file: which one we ship, where it lives, and downloading it.
+//!
+//! The speech model is fixed (not a user choice): `large-v3-turbo`. It is multilingual, but
+//! `crate::stt` pins decoding to English for now.
 
 use crate::config::Config;
 use std::io::{Read, Write};
@@ -12,11 +15,9 @@ pub struct ModelInfo {
     pub size_mb: u32,
 }
 
-pub const MODELS: &[ModelInfo] = &[
-    ModelInfo { id: "base.en", label: "Base (fastest, basic accuracy)", size_mb: 148 },
-    ModelInfo { id: "small.en", label: "Small (fast, good accuracy)", size_mb: 488 },
-    ModelInfo { id: "medium.en", label: "Medium (best accuracy)", size_mb: 1533 },
-];
+/// The one speech model Zipscribe uses.
+pub const MODEL: ModelInfo =
+    ModelInfo { id: "large-v3-turbo", label: "Whisper Large v3 Turbo", size_mb: 1624 };
 
 /// `~/Library/Application Support/Zipscribe/models`
 pub fn models_dir() -> PathBuf {
@@ -26,18 +27,13 @@ pub fn models_dir() -> PathBuf {
         .join("models")
 }
 
-/// Model id for the config value (`"whisper-medium.en"` -> `"medium.en"`).
-pub fn model_id(cfg: &Config) -> &str {
-    cfg.stt_model.trim_start_matches("whisper-")
-}
-
 fn file_name(id: &str) -> String {
     format!("ggml-{id}.bin")
 }
 
-/// Where the model for `id` is installed (may not exist yet).
-pub fn installed_path(id: &str) -> PathBuf {
-    models_dir().join(file_name(id))
+/// Where the speech model is installed (may not exist yet).
+pub fn installed_path() -> PathBuf {
+    models_dir().join(file_name(MODEL.id))
 }
 
 /// Resolve the model file to load: `WF_MODEL`, an explicit config path, the app-support copy, or
@@ -49,20 +45,19 @@ pub fn resolve_path(cfg: &Config) -> PathBuf {
     if !cfg.stt_model_path.is_empty() {
         return PathBuf::from(&cfg.stt_model_path);
     }
-    let id = model_id(cfg);
-    let installed = installed_path(id);
+    let installed = installed_path();
     if installed.exists() {
         return installed;
     }
-    let dev = PathBuf::from("models").join(file_name(id));
+    let dev = PathBuf::from("models").join(file_name(MODEL.id));
     if dev.exists() {
         return dev;
     }
     installed
 }
 
-pub fn is_installed(id: &str) -> bool {
-    installed_path(id).exists()
+pub fn is_installed() -> bool {
+    installed_path().exists()
 }
 
 fn url(id: &str) -> String {
@@ -72,20 +67,18 @@ fn url(id: &str) -> String {
     )
 }
 
-/// Download model `id` into `models_dir()`, calling `progress(done, total)` as bytes arrive.
+/// Download the speech model into `models_dir()`, calling `progress(done, total)` as bytes arrive.
 /// Writes to a `.part` file and renames on success, so a partial download is never mistaken for a
-/// model. Checks the byte count against the server's `Content-Length`.
+/// model. Checks the byte count against the server's `Content-Length`. On success, removes
+/// Whisper models from earlier versions (base/small/medium.en) to reclaim their disk space.
 pub fn download(
-    id: &str,
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf, String> {
-    if !MODELS.iter().any(|m| m.id == id) {
-        return Err(format!("unknown model '{id}'"));
-    }
+    let id = MODEL.id;
     let dir = models_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let dest = installed_path(id);
+    let dest = installed_path();
     let part = dest.with_extension("bin.part");
 
     let client = reqwest::blocking::Client::builder()
@@ -129,7 +122,23 @@ pub fn download(
     }
     std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
     progress(done, total.max(done));
+    remove_legacy_models();
     Ok(dest)
+}
+
+/// Whisper models that earlier versions offered and this one no longer uses.
+const LEGACY_IDS: &[&str] = &["base.en", "small.en", "medium.en"];
+
+fn remove_legacy_models() {
+    for id in LEGACY_IDS {
+        let p = models_dir().join(file_name(id));
+        if p.exists() {
+            match std::fs::remove_file(&p) {
+                Ok(()) => log::info!("[models] removed old speech model {}", p.display()),
+                Err(e) => log::warn!("[models] could not remove {}: {e}", p.display()),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -137,15 +146,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_id_strips_prefix() {
-        let cfg = Config::default();
-        assert_eq!(model_id(&cfg), "medium.en");
-        assert_eq!(file_name("small.en"), "ggml-small.en.bin");
-    }
-
-    #[test]
-    fn unknown_model_is_rejected() {
-        let cancel = AtomicBool::new(false);
-        assert!(download("../evil", &cancel, |_, _| {}).is_err());
+    fn speech_model_is_large_v3_turbo() {
+        assert_eq!(file_name(MODEL.id), "ggml-large-v3-turbo.bin");
+        assert_eq!(
+            url(MODEL.id),
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+        );
+        assert!(!LEGACY_IDS.contains(&MODEL.id));
     }
 }

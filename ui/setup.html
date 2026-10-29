@@ -19,7 +19,7 @@ const STEPS = ["welcome", "mic", "access", "model", "cleanup", "hotkey"];
 let step = 0;
 let cfg;
 let perms = { microphone: "not_determined", accessibility: false };
-let models = [];
+let speech = null;
 let cleanupModels = [];
 let cleanupDl = null; // {id, done, total} while downloading a clean-up model
 let cleanupDlError = null;
@@ -36,12 +36,11 @@ function canContinue() {
   switch (STEPS[step]) {
     case "mic": return perms.microphone === "authorized";
     case "access": return perms.accessibility || accessSkipped;
-    case "model": return !dl && models.find((m) => m.id === selectedModel())?.installed;
+    case "model": return !dl && speech?.installed;
     case "cleanup": return !cfg.cleanup_enabled || (!cleanupDl && cleanupModels.find((m) => m.id === cfg.cleanup_model)?.installed);
     default: return true;
   }
 }
-const selectedModel = () => cfg.stt_model.replace(/^whisper-/, "");
 
 function render() {
   [...$("#dots").children].forEach((d, i) => d.classList.toggle("on", i <= step));
@@ -105,18 +104,14 @@ const views = {
   },
 
   model() {
-    const sel = selectedModel();
-    const cur = models.find((m) => m.id === sel);
+    const cur = speech;
     page.innerHTML = `
       <h1>Speech model</h1>
-      <p class="muted">The model turns your voice into text, on-device. Bigger is more accurate; all are free. It's a one-time download.</p>
-      <div class="card">
-        ${models.map((m) => `
-          <label class="opt">
-            <input type="radio" name="model" value="${m.id}" ${m.id === sel ? "checked" : ""} ${dl ? "disabled" : ""}>
-            <div><b>${m.label}</b> ${m.installed ? `<span class="chip ok">Installed</span>` : ""}<small>${fmtMB(m.size_mb)}</small></div>
-          </label>`).join("")}
-      </div>
+      <p class="muted">The model turns your voice into text, on-device. It's free and a one-time download.</p>
+      <div class="card"><div class="row">
+        <div class="label">${cur.label}<small>${fmtMB(cur.size_mb)}</small></div>
+        ${cur.installed ? `<span class="chip ok">Installed</span>` : ""}
+      </div></div>
       <div id="dlbox" style="margin-top:14px">
         ${dl ? `<div class="bar"><div id="fill" style="width:${dl.total ? (100 * dl.done / dl.total).toFixed(1) : 0}%"></div></div>
           <div class="muted" id="dltext">Downloading… ${fmtBytes(dl.done)} of ${fmtBytes(dl.total)}</div>
@@ -124,11 +119,9 @@ const views = {
         : cur?.installed ? "" : `<button class="primary" id="download">Download ${cur ? fmtMB(cur.size_mb) : ""}</button>`}
         ${dlError ? `<p style="color:var(--bad);margin-top:8px">${dlError}</p>` : ""}
       </div>`;
-    page.querySelectorAll("input[name=model]").forEach((r) =>
-      r.addEventListener("change", () => { cfg.stt_model = "whisper-" + r.value; dlError = null; render(); }));
     $("#download")?.addEventListener("click", async () => {
       dlError = null;
-      try { await invoke("download_model", { id: sel }); dl = { id: sel, done: 0, total: 0 }; }
+      try { await invoke("download_model"); dl = { id: cur.id, done: 0, total: 0 }; }
       catch (e) { dlError = String(e); }
       render();
     });
@@ -241,7 +234,7 @@ async function persist() { await invoke("save_config", { cfg }); }
 
 async function refresh() {
   perms = await invoke("permissions");
-  models = await invoke("model_list");
+  speech = await invoke("speech_model");
   const s = STEPS[step];
   if (s === "mic" || s === "access") render();
   else if (s === "model") { if (!dl) render(); else $("#next").disabled = !canContinue(); }
@@ -274,7 +267,7 @@ listen("download-progress", (e) => {
 listen("download-done", async (e) => {
   dl = null;
   dlError = e.payload.error && e.payload.error !== "cancelled" ? e.payload.error : null;
-  models = await invoke("model_list");
+  speech = await invoke("speech_model");
   if (STEPS[step] === "model") render();
 });
 // Clean-up model download (presets / arbitrary HF repos): its own panel, shared cancel flag.
@@ -299,7 +292,7 @@ listen("cleanup-done", async (e) => {
 (async () => {
   cfg = await invoke("get_config");
   perms = await invoke("permissions");
-  models = await invoke("model_list");
+  speech = await invoke("speech_model");
   await refreshCleanupModels();
   render();
   pollTimer = setInterval(refresh, 1000);

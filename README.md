@@ -4,8 +4,8 @@ A fast, **on-device** macOS menu-bar dictation app. Hold a hotkey, speak, releas
 couple of seconds your words are typed into whatever window you're using. Your voice never leaves
 your Mac.
 
-- **Speech-to-text**: OpenAI Whisper (`whisper.cpp`, Metal GPU accelerated), run inside the app and
-  kept loaded so repeat dictations are fast.
+- **Speech-to-text**: OpenAI Whisper Large v3 Turbo (`whisper.cpp`, Metal GPU accelerated), run
+  inside the app and kept loaded so repeat dictations are fast. English only for now.
 - **Clean-up (optional)**: a small language model, running **in-process via Apple MLX** and kept
   resident, removes "um"s, fixes grammar and punctuation, and keeps your meaning without inventing
   anything. If no clean-up model is installed (or inference fails), you still get a lightly
@@ -17,7 +17,7 @@ your Mac.
 ## Requirements
 
 - A Mac with Apple Silicon (M1 or later) running macOS 14 (Sonoma) or newer
-- About 150 MB – 1.6 GB of disk for the speech model (you choose the size during setup)
+- About 1.6 GB of disk for the speech model (downloaded once during setup)
 - *Optional:* a clean-up language model — pick and download a size in the app (on-device, Apple MLX)
 
 ## Install
@@ -40,8 +40,9 @@ The guide walks through six steps:
 2. **Microphone** — click *Allow microphone* and approve the macOS prompt.
 3. **Accessibility** — needed so Zipscribe can press keys to type for you. Click *Grant access*,
    then switch Zipscribe on in the list that opens. Or skip it and use clipboard mode instead.
-4. **Speech model** — pick a size and download it (one time). Medium is the most accurate; Base is
-   the fastest.
+4. **Speech model** — download Whisper Large v3 Turbo (one time, about 1.6 GB). If you're
+   upgrading from a version that used Base/Small/Medium, Settings opens at launch so you can
+   download it; the old model is deleted once the new one is in place.
 5. **Text clean-up** *(optional)* — see below.
 6. **Hotkey** — the default is **Ctrl + Space**. Try it in the box.
 
@@ -95,7 +96,7 @@ the clean-up model, edit the clean-up instructions, and turn on **Start at login
 
 Open **🎙 → Settings… → Help → Uninstall…**. Zipscribe quits, moves itself to the Trash, removes
 the start-at-login item, and resets its microphone and Accessibility permissions. Two checkboxes
-let you keep the downloaded speech model (up to 1.5 GB) or your settings if you plan to reinstall.
+let you keep the downloaded speech model (about 1.6 GB) or your settings if you plan to reinstall.
 
 There is no separate clean-up service to remove — the model lives in your model folder and is
 taken out by the *Delete the downloaded models* checkbox above, or by deleting that folder.

@@ -29,7 +29,7 @@ fn generate_plist(binary: &Path, log_dir: &Path, working_dir: &Path) -> String {
     let err = log_dir.join("zipscribe.err.log");
     // LaunchAgent plists require a well-formed dictionary; values are absolute paths.
     // `WorkingDirectory` is the repo root (resolved at install time) so relative model paths
-    // like `models/ggml-medium.en.bin` resolve for the auto-started service, which otherwise
+    // like `models/ggml-large-v3-turbo.bin` resolve for the auto-started service, which otherwise
     // inherits launchd's default cwd of $HOME.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>

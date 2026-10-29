@@ -1,6 +1,6 @@
 //! In-process STT via `whisper-rs` (whisper.cpp).
 //!
-//! Loads `GGML` `whisper-medium.en` once and keeps the **context** (the heavy weights)
+//! Loads the `GGML` Whisper model (`large-v3-turbo`) once and keeps the **context** (the heavy weights)
 //! resident in memory, so each transcription pays only inference cost (no reload). whisper.cpp
 //! runs each `full` on a fresh, lightweight *state* — that's the correct pattern: the model
 //! stays resident, the per-call state is cheap to recreate. `transcribe` takes 16 kHz mono i16
@@ -61,7 +61,9 @@ impl Transcriber {
         let mut state = self.ctx.create_state()?;
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
         params.set_n_threads(thread_count());
-        // English-only model: fix the language, silence all console prints so logs stay clean.
+        // The model is multilingual, but Zipscribe is English-only for now: pin the language so
+        // it never auto-detects (and mis-detects) another one. Silence all console prints so logs
+        // stay clean.
         params.set_language(Some("en"));
         params.set_print_special(false);
         params.set_print_progress(false);

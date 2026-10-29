@@ -89,7 +89,7 @@
 
 <script src="common.js"></script>
 <script>
-let cfg, models = [], cleanupModels = [], dl = null, cleanupDl = null, dirty = false;
+let cfg, speech = null, cleanupModels = [], dl = null, cleanupDl = null, dirty = false;
 
 const els = {};
 ["enabled","hotkey","login","output_mode","newline","cleanup","prompt","state","cleanup_state"].forEach((k) => (els[k] = $("#" + k)));
@@ -150,21 +150,16 @@ function fillCleanupModels() {
 }
 
 function fillModels() {
-  const sel = cfg.stt_model.replace(/^whisper-/, "");
-  $("#models").innerHTML = models.map((m) => `
-    <label class="opt">
-      <input type="radio" name="model" value="${m.id}" ${m.id === sel ? "checked" : ""}>
-      <div style="flex:1"><b>${m.label}</b> ${m.installed ? `<span class="chip ok">Installed</span>` : ""}<small>${fmtMB(m.size_mb)}</small></div>
-      ${m.installed ? "" : `<button data-dl="${m.id}" ${dl ? "disabled" : ""}>Download</button>`}
-    </label>`).join("");
-  $("#models").querySelectorAll("input[name=model]").forEach((r) =>
-    r.addEventListener("change", () => { cfg.stt_model = "whisper-" + r.value; markDirty(); }));
-  $("#models").querySelectorAll("[data-dl]").forEach((b) =>
-    b.addEventListener("click", async (ev) => {
-      ev.preventDefault();
-      try { await invoke("download_model", { id: b.dataset.dl }); dl = { id: b.dataset.dl, done: 0, total: 0 }; showDl(); fillModels(); }
-      catch (e) { toast(String(e)); }
-    }));
+  const m = speech;
+  $("#models").innerHTML = `
+    <div class="row">
+      <div class="label">${m.label}<small>${fmtMB(m.size_mb)}</small></div>
+      ${m.installed ? `<span class="chip ok">Installed</span>` : `<button id="b_dl" ${dl ? "disabled" : ""}>Download</button>`}
+    </div>`;
+  $("#b_dl")?.addEventListener("click", async () => {
+    try { await invoke("download_model"); dl = { id: m.id, done: 0, total: 0 }; showDl(); fillModels(); }
+    catch (e) { toast(String(e)); }
+  });
 }
 
 function showDl(err) {
@@ -250,7 +245,7 @@ $("#save").addEventListener("click", async () => {
 listen("download-progress", (e) => { dl = e.payload; showDl(); });
 listen("download-done", async (e) => {
   dl = null;
-  models = await invoke("model_list");
+  speech = await invoke("speech_model");
   showDl(e.payload.error && e.payload.error !== "cancelled" ? e.payload.error : null);
   fillModels();
 });
@@ -272,7 +267,7 @@ listen("cleanup-done", async (e) => {
 
 (async () => {
   cfg = await invoke("get_config");
-  models = await invoke("model_list");
+  speech = await invoke("speech_model");
   els.login.checked = await invoke("login_item_enabled");
   $("#logpath").textContent = await invoke("log_path");
   const hk = hotkeyRecorder(els.hotkey, cfg.hotkey, (v) => { cfg.hotkey = v; markDirty(); });

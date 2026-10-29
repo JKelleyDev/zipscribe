@@ -31,8 +31,8 @@ pub struct Config {
     pub setup_complete: bool,
 
     // ---- STT (whisper) ----
-    /// Whisper model identifier (must be `whisper-medium.en` per the goal).
-    pub stt_model: String,
+    // The Whisper model itself is fixed (`crate::models::MODEL`), not a setting. Old config files
+    // that still carry `stt_model` load fine: unknown fields are ignored.
     /// Optional override filesystem path to the GGML model file.
     pub stt_model_path: String,
     /// Whisper worker thread count (0 => auto).
@@ -63,7 +63,6 @@ impl Default for Config {
             output_mode: "type".to_string(),
             type_trailing_newline: false,
             setup_complete: false,
-            stt_model: "whisper-medium.en".to_string(),
             stt_model_path: String::new(),
             stt_threads: 0,
             cleanup_enabled: true,
@@ -198,7 +197,6 @@ mod tests {
         );
         assert_eq!(d.hotkey, "ctrl+space");
         assert_eq!(d.output_mode, "type");
-        assert_eq!(d.stt_model, "whisper-medium.en");
         assert_eq!(d.cleanup_model, "qwen3-0.6b-4bit");
         assert!(d.cleanup_model_path.is_empty());
         assert!(d.cleanup_enabled);
@@ -260,14 +258,13 @@ mod tests {
         // A file that sets only `hotkey` under a `[general]` section must load,
         // ignoring unknown sections/fields and defaulting the rest.
         let mut fp = std::fs::File::create(&f).unwrap();
-        fp.write_all(b"hotkey = \"alt+q\"\ntotally_unknown = 42\n")
+        fp.write_all(b"hotkey = \"alt+q\"\nstt_model = \"whisper-medium.en\"\ntotally_unknown = 42\n")
             .unwrap();
 
         let cfg = Config::load().unwrap_or_else(|e| panic!("load should succeed, got {e}"));
         assert_eq!(cfg.hotkey, "alt+q");
         // Unknown fields/sections silently ignored; missing ones defaulted:
         assert!(cfg.enabled);
-        assert_eq!(cfg.stt_model, "whisper-medium.en");
         assert_eq!(cfg.output_mode, "type");
         assert!(!cfg.cleanup_model.is_empty());
 

@@ -1,6 +1,6 @@
 //! zipscribe — local, on-device macOS dictation app.
 //!
-//! Pipeline: Push-to-Talk → capture mic → transcribe (whisper-medium.en, in-process)
+//! Pipeline: Push-to-Talk → capture mic → transcribe (whisper large-v3-turbo, in-process)
 //! → clean (in-process MLX LLM) → type cleansed text into the focused window.
 //!
 //! This module is the skeleton entry point. Modules are implemented in later steps:
@@ -185,7 +185,7 @@ fn run_p2t_demo() -> Result<(), String> {
 fn run_transcribe(files: &[std::string::String]) -> Result<(), Box<dyn std::error::Error>> {
     let _ = env_logger::try_init();
     // Model path: env WF_MODEL overrides, else the default in-repo model.
-    let model = std::env::var("WF_MODEL").unwrap_or_else(|_| "models/ggml-medium.en.bin".into());
+    let model = std::env::var("WF_MODEL").unwrap_or_else(|_| "models/ggml-large-v3-turbo.bin".into());
     eprintln!("[transcribe] loading model (resident): {model}");
     let t_load = std::time::Instant::now();
     let mut stt = stt::Transcriber::load(&model)?;

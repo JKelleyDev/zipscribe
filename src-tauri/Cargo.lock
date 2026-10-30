@@ -6349,6 +6349,7 @@ dependencies = [
  "global-hotkey",
  "log",
  "mlxrs",
+ "mlxrs-sys",
  "objc2",
  "reqwest",
  "serde",

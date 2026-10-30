@@ -28,11 +28,29 @@ pub struct MlxModel {
     ctx: ModelContext,
 }
 
+/// Disable MLX's buffer cache and release anything it already holds.
+///
+/// By default MLX keeps freed GPU buffers for reuse, with a limit of most of system RAM. In a
+/// long-running menu-bar app that cache only grows: swapping clean-up models parked the old
+/// model's ~1 GB of weights in it for good. Our prompts are tiny, so reusing buffers buys no
+/// measurable speed (0.15s per clean-up either way) and freeing them immediately is the better
+/// trade.
+fn release_cache() {
+    let mut prior = 0usize;
+    // SAFETY: plain MLX-C calls with a valid out-pointer; they only touch MLX's allocator state.
+    unsafe {
+        mlxrs_sys::mlx_set_cache_limit(&mut prior, 0);
+        mlxrs_sys::mlx_clear_cache();
+    }
+}
+
 /// Load an MLX model directory (safetensors + tokenizer + config.json).
 ///
 /// Returns `Err` (→ caller falls back to `light_cleanse`) on any missing file, wrong format,
 /// or backend failure.
 pub fn load_model(model_dir: &Path) -> Result<MlxModel, String> {
+    // Free whatever a previously dropped model left behind before allocating the new one.
+    release_cache();
     // Single in-process load: typed config + owned weights + tokenizer.
     let (config, weights, tokenizer) =
         load::load(model_dir).map_err(|e| format!("mlx load failed: {e}"))?;

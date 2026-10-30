@@ -28,4 +28,6 @@ objc2 = "0.6"
 # (no Ollama, no external daemon). MLX builds with its Metal (GPU) backend, which needs full Xcode
 # with the Metal toolchain; there is no CPU build.
 mlxrs = { version = "0.2", features = ["lm", "qwen3", "tokenizer-chat"] }
+# Raw MLX-C bindings (already built by `mlxrs`), for the buffer-cache controls `mlxrs` doesn't wrap.
+mlxrs-sys = "0.2"
 

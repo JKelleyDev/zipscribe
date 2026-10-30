@@ -185,7 +185,7 @@ fn run_p2t_demo() -> Result<(), String> {
 fn run_transcribe(files: &[std::string::String]) -> Result<(), Box<dyn std::error::Error>> {
     let _ = env_logger::try_init();
     // Model path: env WF_MODEL overrides, else the default in-repo model.
-    let model = std::env::var("WF_MODEL").unwrap_or_else(|_| "models/ggml-large-v3-turbo.bin".into());
+    let model = std::env::var("WF_MODEL").unwrap_or_else(|_| "models/ggml-large-v3-turbo-q5_0.bin".into());
     eprintln!("[transcribe] loading model (resident): {model}");
     let t_load = std::time::Instant::now();
     let mut stt = stt::Transcriber::load(&model)?;

@@ -1,7 +1,8 @@
 //! In-process STT via `whisper-rs` (whisper.cpp).
 //!
-//! Loads the `GGML` Whisper model (`large-v3-turbo`) once and keeps the **context** (the heavy weights)
-//! resident in memory, so each transcription pays only inference cost (no reload). whisper.cpp
+//! Loads the `GGML` Whisper model (`large-v3-turbo`, 5-bit quantized) once and keeps the
+//! **context** (the heavy weights) resident in memory, so each transcription pays only inference
+//! cost (no reload). whisper.cpp
 //! runs each `full` on a fresh, lightweight *state* — that's the correct pattern: the model
 //! stays resident, the per-call state is cheap to recreate. `transcribe` takes 16 kHz mono i16
 //! PCM (exactly what `crate::capture` produces) and returns the raw transcript + timing.

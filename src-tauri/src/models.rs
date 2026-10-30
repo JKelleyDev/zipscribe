@@ -1,7 +1,9 @@
 //! The Whisper model file: which one we ship, where it lives, and downloading it.
 //!
-//! The speech model is fixed (not a user choice): `large-v3-turbo`. It is multilingual, but
-//! `crate::stt` pins decoding to English for now.
+//! The speech model is fixed (not a user choice): `large-v3-turbo`, 5-bit quantized (`q5_0`). The
+//! quantized weights use ~780 MB of memory while transcribing versus ~1.9 GB for the f16 original,
+//! with identical transcripts in our tests. It is multilingual, but `crate::stt` pins decoding to
+//! English for now.
 
 use crate::config::Config;
 use std::io::{Read, Write};
@@ -17,7 +19,7 @@ pub struct ModelInfo {
 
 /// The one speech model Zipscribe uses.
 pub const MODEL: ModelInfo =
-    ModelInfo { id: "large-v3-turbo", label: "Whisper Large v3 Turbo", size_mb: 1624 };
+    ModelInfo { id: "large-v3-turbo-q5_0", label: "Whisper Large v3 Turbo", size_mb: 574 };
 
 /// `~/Library/Application Support/Zipscribe/models`
 pub fn models_dir() -> PathBuf {
@@ -70,7 +72,8 @@ fn url(id: &str) -> String {
 /// Download the speech model into `models_dir()`, calling `progress(done, total)` as bytes arrive.
 /// Writes to a `.part` file and renames on success, so a partial download is never mistaken for a
 /// model. Checks the byte count against the server's `Content-Length`. On success, removes
-/// Whisper models from earlier versions (base/small/medium.en) to reclaim their disk space.
+/// Whisper models from earlier versions (base/small/medium.en, f16 large-v3-turbo) to reclaim
+/// their disk space.
 pub fn download(
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64, u64),
@@ -127,7 +130,7 @@ pub fn download(
 }
 
 /// Whisper models that earlier versions offered and this one no longer uses.
-const LEGACY_IDS: &[&str] = &["base.en", "small.en", "medium.en"];
+const LEGACY_IDS: &[&str] = &["base.en", "small.en", "medium.en", "large-v3-turbo"];
 
 fn remove_legacy_models() {
     for id in LEGACY_IDS {
@@ -146,11 +149,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn speech_model_is_large_v3_turbo() {
-        assert_eq!(file_name(MODEL.id), "ggml-large-v3-turbo.bin");
+    fn speech_model_is_large_v3_turbo_q5() {
+        assert_eq!(file_name(MODEL.id), "ggml-large-v3-turbo-q5_0.bin");
         assert_eq!(
             url(MODEL.id),
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
         );
         assert!(!LEGACY_IDS.contains(&MODEL.id));
     }
